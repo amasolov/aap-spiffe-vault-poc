@@ -55,6 +55,7 @@
               server {
                 bind_address = "0.0.0.0"
                 bind_port = "8081"
+                socket_path = "/run/spire/data/api.sock"
                 trust_domain = "{{ spire_trust_domain }}"
                 data_dir = "/run/spire/data"
                 log_level = "INFO"
@@ -139,6 +140,18 @@
               name: spire-server
               namespace: "{{ spire_namespace }}"
 
+    - name: Grant SPIRE Agent privileged SCC
+      ansible.builtin.command:
+        cmd: "oc adm policy add-scc-to-user privileged -z spire-agent -n {{ spire_namespace }}"
+      changed_when: true
+      failed_when: false
+
+    - name: Grant SPIRE Server anyuid SCC
+      ansible.builtin.command:
+        cmd: "oc adm policy add-scc-to-user anyuid -z spire-server -n {{ spire_namespace }}"
+      changed_when: true
+      failed_when: false
+
     - name: Deploy SPIRE Server StatefulSet
       kubernetes.core.k8s:
         state: present
@@ -160,6 +173,9 @@
                   app: spire-server
               spec:
                 serviceAccountName: spire-server
+                securityContext:
+                  runAsUser: 0
+                  fsGroup: 0
                 containers:
                   - name: spire-server
                     image: "{{ spire_server_image }}"
@@ -178,6 +194,8 @@
                         command:
                           - /opt/spire/bin/spire-server
                           - healthcheck
+                          - -socketPath
+                          - /run/spire/data/api.sock
                       initialDelaySeconds: 15
                       periodSeconds: 30
                     readinessProbe:
@@ -185,12 +203,45 @@
                         command:
                           - /opt/spire/bin/spire-server
                           - healthcheck
+                          - -socketPath
+                          - /run/spire/data/api.sock
                       initialDelaySeconds: 10
                       periodSeconds: 10
+                  - name: oidc-discovery-provider
+                    image: "{{ spire_oidc_image }}"
+                    args:
+                      - "-config"
+                      - "/run/spire/oidc-config/oidc-discovery-provider.conf"
+                    ports:
+                      - containerPort: 8080
+                        name: http
+                      - containerPort: 8008
+                        name: health
+                    volumeMounts:
+                      - name: oidc-config
+                        mountPath: /run/spire/oidc-config
+                        readOnly: true
+                      - name: data
+                        mountPath: /run/spire/data
+                    readinessProbe:
+                      httpGet:
+                        path: /ready
+                        port: 8008
+                      initialDelaySeconds: 10
+                      periodSeconds: 10
+                    livenessProbe:
+                      httpGet:
+                        path: /live
+                        port: 8008
+                      initialDelaySeconds: 15
+                      periodSeconds: 30
                 volumes:
                   - name: config
                     configMap:
                       name: spire-server-config
+                  - name: oidc-config
+                    configMap:
+                      name: oidc-discovery-provider-config
             volumeClaimTemplates:
               - metadata:
                   name: data
@@ -232,10 +283,11 @@
               agent {
                 data_dir = "/run/spire"
                 log_level = "INFO"
-                server_address = "spire-server"
+                server_address = "spire-server.{{ spire_namespace }}.svc.cluster.local"
                 server_port = "8081"
                 socket_path = "/run/spire/sockets/agent.sock"
                 trust_domain = "{{ spire_trust_domain }}"
+                insecure_bootstrap = true
               }
 
               plugins {
@@ -330,6 +382,8 @@
                         readOnly: true
                       - name: spire-agent-socket
                         mountPath: /run/spire/sockets
+                      - name: spire-token
+                        mountPath: /var/run/secrets/tokens
                     livenessProbe:
                       exec:
                         command:
@@ -356,6 +410,13 @@
                     hostPath:
                       path: /run/spire/sockets
                       type: DirectoryOrCreate
+                  - name: spire-token
+                    projected:
+                      sources:
+                        - serviceAccountToken:
+                            path: spire-agent
+                            expirationSeconds: 7200
+                            audience: spire-server
 
     # --- OIDC Discovery Provider ---
     - name: Deploy OIDC Discovery Provider ConfigMap
@@ -370,13 +431,12 @@
           data:
             oidc-discovery-provider.conf: |
               log_level = "INFO"
-              domains = ["oidc-discovery-{{ spire_namespace }}.{{ cluster_domain }}"]
+              domains = ["oidc-discovery-{{ spire_namespace }}.{{ cluster_domain }}", "oidc-discovery.{{ spire_namespace }}.svc.cluster.local"]
               allow_insecure_scheme = true
               insecure_addr = ":8080"
 
-              workload_api {
-                socket_path = "/run/spire/sockets/agent.sock"
-                trust_domain = "{{ spire_trust_domain }}"
+              server_api {
+                address = "unix:///run/spire/data/api.sock"
               }
 
               health_checks {
@@ -384,64 +444,6 @@
                 ready_path = "/ready"
                 live_path = "/live"
               }
-
-    - name: Deploy OIDC Discovery Provider Deployment
-      kubernetes.core.k8s:
-        state: present
-        definition:
-          apiVersion: apps/v1
-          kind: Deployment
-          metadata:
-            name: oidc-discovery-provider
-            namespace: "{{ spire_namespace }}"
-          spec:
-            replicas: 1
-            selector:
-              matchLabels:
-                app: oidc-discovery-provider
-            template:
-              metadata:
-                labels:
-                  app: oidc-discovery-provider
-              spec:
-                containers:
-                  - name: oidc-discovery-provider
-                    image: "{{ spire_oidc_image }}"
-                    args:
-                      - "-config"
-                      - "/run/spire/config/oidc-discovery-provider.conf"
-                    ports:
-                      - containerPort: 8080
-                        name: http
-                      - containerPort: 8008
-                        name: health
-                    volumeMounts:
-                      - name: config
-                        mountPath: /run/spire/config
-                        readOnly: true
-                      - name: spire-agent-socket
-                        mountPath: /run/spire/sockets
-                        readOnly: true
-                    readinessProbe:
-                      httpGet:
-                        path: /ready
-                        port: 8008
-                      initialDelaySeconds: 5
-                      periodSeconds: 10
-                    livenessProbe:
-                      httpGet:
-                        path: /live
-                        port: 8008
-                      initialDelaySeconds: 10
-                      periodSeconds: 30
-                volumes:
-                  - name: config
-                    configMap:
-                      name: oidc-discovery-provider-config
-                  - name: spire-agent-socket
-                    hostPath:
-                      path: /run/spire/sockets
-                      type: Directory
 
     - name: Deploy OIDC Discovery Provider Service
       kubernetes.core.k8s:
@@ -454,7 +456,7 @@
             namespace: "{{ spire_namespace }}"
           spec:
             selector:
-              app: oidc-discovery-provider
+              app: spire-server
             ports:
               - port: 80
                 targetPort: 8080
@@ -517,6 +519,7 @@
         cmd: >-
           oc exec -n {{ spire_namespace }} {{ __spire_server_pod.stdout_lines[0] }} --
           /opt/spire/bin/spire-server entry create
+          -socketPath /run/spire/data/api.sock
           -spiffeID {{ item.value.spiffe_id }}
           -parentID spiffe://{{ spire_trust_domain }}/spire/agent/k8s_psat/hosted-1
           -selector k8s:ns:{{ aap_namespace }}
@@ -575,7 +578,14 @@
                 containers:
                   - name: vault
                     image: "{{ vault_image }}"
-                    command: ["vault", "server", "-dev", "-dev-listen-address=0.0.0.0:8200", "-dev-root-token-id=root"]
+                    command:
+                      - sh
+                      - -c
+                      - |
+                        vault server -dev \
+                          -dev-listen-address=0.0.0.0:8200 \
+                          -dev-root-token-id=root \
+                          -dev-no-store-token
                     ports:
                       - containerPort: 8200
                         name: http
@@ -584,6 +594,10 @@
                         value: "http://127.0.0.1:8200"
                       - name: VAULT_DEV_ROOT_TOKEN_ID
                         value: "root"
+                      - name: SKIP_SETCAP
+                        value: "true"
+                      - name: HOME
+                        value: "/tmp"
                     readinessProbe:
                       httpGet:
                         path: /v1/sys/health
@@ -649,31 +663,37 @@
 
     # --- Seed demo secrets for each org ---
     - name: Enable KV v2 secrets engine
-      ansible.builtin.command:
+      ansible.builtin.shell:
         cmd: >-
           oc exec -n {{ vault_namespace }} {{ __vault_pod.stdout_lines[0] }} --
+          env VAULT_TOKEN=root
           vault secrets enable -version=2 -path=secret kv
+        executable: /bin/bash
       register: __kv_enable
       changed_when: "'Success' in __kv_enable.stdout"
       failed_when: false
 
     - name: Seed platform secrets
-      ansible.builtin.command:
+      ansible.builtin.shell:
         cmd: >-
           oc exec -n {{ vault_namespace }} {{ __vault_pod.stdout_lines[0] }} --
+          env VAULT_TOKEN=root
           vault kv put secret/hub/aap/config
           admin_token=spiffe-rotated-token-$(date +%s)
           db_password=aap-db-secret-from-vault
+        executable: /bin/bash
       changed_when: true
 
     - name: Seed org-scoped secrets
-      ansible.builtin.command:
+      ansible.builtin.shell:
         cmd: >-
           oc exec -n {{ vault_namespace }} {{ __vault_pod.stdout_lines[0] }} --
+          env VAULT_TOKEN=root
           vault kv put secret/aap/org/{{ item.org }}/credentials
           ssh_key="org-{{ item.org }}-ssh-private-key"
           api_token="org-{{ item.org }}-cloud-api-token-$(date +%s)"
           cloud_password="org-{{ item.org }}-cloud-password"
+        executable: /bin/bash
       loop:
         - { org: infra-corp }
         - { org: appdev-squad }
@@ -682,13 +702,15 @@
       changed_when: true
 
     - name: Seed EDA webhook secret
-      ansible.builtin.command:
+      ansible.builtin.shell:
         cmd: >-
           oc exec -n {{ vault_namespace }} {{ __vault_pod.stdout_lines[0] }} --
+          env VAULT_TOKEN=root
           vault kv put secret/aap/eda/webhook-credentials
           pagerduty_api_key="eda-pagerduty-key-rotated-$(date +%s)"
           aws_access_key="eda-aws-access-key"
           aws_secret_key="eda-aws-secret-rotated-$(date +%s)"
+        executable: /bin/bash
       changed_when: true
 
     - name: Vault deployment complete
@@ -715,21 +737,25 @@
       changed_when: false
 
     - name: Enable JWT auth method
-      ansible.builtin.command:
+      ansible.builtin.shell:
         cmd: >-
           oc exec -n {{ vault_namespace }} {{ __vault_pod.stdout_lines[0] }} --
+          env VAULT_TOKEN=root
           vault auth enable jwt
+        executable: /bin/bash
       register: __jwt_enable
       changed_when: "'Success' in __jwt_enable.stdout"
       failed_when: false
 
-    - name: Configure JWT auth with SPIRE OIDC discovery
-      ansible.builtin.command:
+    - name: Configure JWT auth with SPIRE OIDC discovery (internal URL)
+      ansible.builtin.shell:
         cmd: >-
           oc exec -n {{ vault_namespace }} {{ __vault_pod.stdout_lines[0] }} --
+          env VAULT_TOKEN=root
           vault write auth/jwt/config
-          oidc_discovery_url=https://oidc-discovery-{{ spire_namespace }}.{{ cluster_domain }}
+          oidc_discovery_url=http://oidc-discovery.{{ spire_namespace }}.svc.cluster.local
           default_role=aap-platform
+        executable: /bin/bash
       register: __jwt_config
       changed_when: "'Success' in __jwt_config.stdout"
       retries: 5
@@ -740,7 +766,7 @@
       ansible.builtin.shell:
         cmd: |
           oc exec -n {{ vault_namespace }} {{ __vault_pod.stdout_lines[0] }} -- \
-            sh -c 'cat <<POLICY | vault policy write {{ item.value.vault_policy }} -
+            sh -c 'export VAULT_TOKEN=root; cat <<POLICY | vault policy write {{ item.value.vault_policy }} -
           {% for path in item.value.vault_paths %}
           path "{{ path }}" {
             capabilities = ["read"]
@@ -753,9 +779,10 @@
 
     # --- Create JWT roles (one per SPIFFE identity) ---
     - name: Create Vault JWT roles for each SPIFFE identity
-      ansible.builtin.command:
+      ansible.builtin.shell:
         cmd: >-
           oc exec -n {{ vault_namespace }} {{ __vault_pod.stdout_lines[0] }} --
+          env VAULT_TOKEN=root
           vault write auth/jwt/role/{{ item.value.vault_role }}
           role_type=jwt
           user_claim=sub
@@ -763,6 +790,7 @@
           bound_subject={{ item.value.spiffe_id }}
           token_ttl=3600
           token_policies={{ item.value.vault_policy }}
+        executable: /bin/bash
       loop: "{{ aap_spiffe_ids | dict2items }}"
       changed_when: true
 

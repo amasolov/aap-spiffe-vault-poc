@@ -18,7 +18,7 @@ spire_helper_image: "ghcr.io/spiffe/spiffe-helper:0.8.0"
 # Vault
 vault_namespace: vault
 vault_version: "1.17.2"
-vault_image: "hashicorp/vault:{{ vault_version }}"
+vault_image: "docker.io/hashicorp/vault:{{ vault_version }}"
 vault_route: "vault.{{ cluster_domain }}"
 vault_internal_url: "https://vault.{{ vault_namespace }}.svc.cluster.local:8200"
 
