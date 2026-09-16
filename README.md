@@ -29,8 +29,8 @@ Replace the static Vault token with SPIFFE JWT authentication:
                     SPIRE Server
                    (trust root)
                     /         \
-            SPIRE Agent     OIDC Discovery
-           (workload API)   (JWKS for Vault)
+            SPIRE Agent     OIDC Discovery Provider
+           (workload API)   (serves JWKS for Vault)
                 |                 |
           spiffe-helper      Vault JWT Auth
          (fetch JWT-SVID)    (validate JWT)
@@ -42,13 +42,51 @@ Replace the static Vault token with SPIFFE JWT authentication:
          (consumes credentials)
 ```
 
-### Flow
+### Components
 
-1. **SPIRE Agent** validates AAP pod via kubelet attestor, mints SVID
-2. **spiffe-helper** sidecar fetches JWT-SVID from Workload API (5min TTL)
-3. **spiffe-vault-client** POSTs JWT to Vault `/v1/auth/jwt/login`
-4. **Vault** validates JWT against SPIRE OIDC public keys, returns scoped token (1h TTL)
-5. **AAP** consumes credentials fetched from Vault
+**SPIRE Server** is the trust root. It issues short-lived cryptographic
+identities (SVIDs) and serves as the certificate authority for the trust
+domain. Runs as a StatefulSet in `spire-system`.
+
+**SPIRE Agent** runs as a DaemonSet on every node. It attests workloads via
+the kubelet (using projected service account tokens) and exposes the Workload
+API as a Unix socket on the host at `/run/spire/sockets/agent.sock`.
+
+**OIDC Discovery Provider** runs as a sidecar in the SPIRE Server pod. It
+publishes a standard `/.well-known/openid-configuration` endpoint that serves
+the public keys (JWKS) Vault uses to verify JWT-SVIDs. This is the bridge
+that lets Vault trust SPIRE-issued tokens without a direct integration.
+
+**spiffe-helper** is an init container (from the official SPIRE project) that
+connects to the SPIRE Agent's Workload API and writes a JWT-SVID to a shared
+volume (`/svids/jwt.token`). The JWT has a 5-minute TTL and contains the pod's
+SPIFFE ID as the `sub` claim and the Vault audience as the `aud` claim. It
+exits once the SVID is written (using `-exitWhenReady`).
+
+**spiffe-vault-client** (`scripts/spiffe-vault-client.py`) is the credential
+manager adapted from the Validated Pattern's
+[qtodo sidecar](https://github.com/validatedpatterns/layered-zero-trust). It:
+
+1. Reads the JWT-SVID file written by spiffe-helper
+2. POSTs it to Vault's `/v1/auth/jwt/login` endpoint with the assigned role
+3. Receives a scoped Vault token (1-hour TTL, specific policy)
+4. Uses that token to read secrets from the allowed Vault path
+5. Writes the secrets to a file that AAP can consume
+
+It supports three modes: `--init` (fetch once and exit, used in the CronJob),
+sidecar (continuous loop with automatic token renewal at 50% of lease), and
+`--print-secrets` (one-shot demo output to stdout).
+
+### End-to-End Flow
+
+1. **SPIRE Agent** validates the AAP pod via the kubelet k8s_psat attestor
+2. **spiffe-helper** init container fetches a JWT-SVID from the Workload API (5-min TTL)
+3. **spiffe-vault-client** POSTs the JWT to Vault `/v1/auth/jwt/login`
+4. **Vault** validates the JWT signature against SPIRE's OIDC public keys and checks
+   the `sub` (SPIFFE ID) and `aud` (audience) claims match the configured role
+5. **Vault** returns a scoped token (1-hour TTL) with only the policies assigned to that role
+6. **spiffe-vault-client** uses the token to read secrets and writes them to a shared file
+7. **AAP** consumes the credentials from the file
 
 ## Three Demo Scenarios
 
