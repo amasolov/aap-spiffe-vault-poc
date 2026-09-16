@@ -11,13 +11,6 @@ AAP currently authenticates to HashiCorp Vault using the **root Vault token**.
 This gives AAP unrestricted access to every secret in Vault. The token never
 expires and is never automatically rotated.
 
-> "in the latest patterns we can also have AAP pull secrets from the cluster
-> vault BUT it's using the root vault key to do it which is suboptimal. I think
-> the enhancements we need to do for spiffe/spire will enable us to create
-> shorter-lived creds that AAP can also use for cred-pulling"
->
-> *Martin Jackson, Validated Patterns architect (2025-04-24)*
-
 ## The Solution
 
 Replace the static Vault token with SPIFFE JWT authentication:
