@@ -166,15 +166,6 @@ validated pattern:
 - [Vault SPIFFE auth method](https://developer.hashicorp.com/vault/docs/auth/spiffe/spiffe)
 - [AAP credential plugins](https://docs.ansible.com/projects/awx/en/24.6.1/userguide/credential_plugins.html)
 
-## Key Contacts
-
-| Person | Role | Context |
-|---|---|---|
-| Martin Jackson | VP Architect | Identified the root-key gap |
-| Andrew Block | ZTVP Tech Lead | Built SPIFFE+Vault JWT auth |
-| Manuel Lorenzo | ZTVP Engineer | Wrote spiffe-vault-client.py |
-| Min Zhang | ZTVP Engineer | Extended SPIFFE JWT for supply chain |
-
 ## License
 
 Apache-2.0
