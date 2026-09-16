@@ -1,0 +1,359 @@
+---
+# AAP SPIFFE/Vault POC - Demo Scenarios
+#
+# Three progressive demonstrations:
+#   1. Platform zero-trust: SPIFFE identity replaces root Vault token
+#   2. Multi-org isolation: org-scoped secrets via SPIFFE + Vault policies
+#   3. EDA dynamic credentials: event-driven secret retrieval
+#
+# Usage:
+#   ansible-playbook demo-scenarios.yml --tags scenario1     # Platform identity
+#   ansible-playbook demo-scenarios.yml --tags scenario2     # Multi-org isolation
+#   ansible-playbook demo-scenarios.yml --tags scenario3     # EDA dynamic creds
+#   ansible-playbook demo-scenarios.yml                      # All three
+
+# ============================================================
+# Scenario 1: Platform Zero-Trust
+# "AAP authenticates to Vault with SPIFFE identity, not root token"
+# ============================================================
+- name: "Scenario 1: Platform Zero-Trust Identity"
+  hosts: localhost
+  gather_facts: false
+  connection: local
+  tags: [scenario1]
+  environment:
+    KUBECONFIG: "{{ kubeconfig }}"
+  tasks:
+    - name: "DEMO: Show the problem - root token has god access"
+      ansible.builtin.pause:
+        prompt: |
+          ╔══════════════════════════════════════════════════════════════╗
+          ║  SCENARIO 1: Platform Zero-Trust Identity                  ║
+          ╠══════════════════════════════════════════════════════════════╣
+          ║                                                            ║
+          ║  BEFORE: AAP uses the Vault root token.                    ║
+          ║  Root token can read ANY secret in Vault.                  ║
+          ║  It never expires. It never rotates.                       ║
+          ║                                                            ║
+          ║  AFTER: AAP uses a SPIFFE JWT identity.                    ║
+          ║  The JWT is valid for 5 minutes.                           ║
+          ║  The Vault token is scoped to aap/* paths only.            ║
+          ║  Identity is cryptographic, not a shared secret.           ║
+          ║                                                            ║
+          ╚══════════════════════════════════════════════════════════════╝
+          Press ENTER to begin the demo...
+
+    - name: Get SPIRE Server pod
+      ansible.builtin.command:
+        cmd: "oc -n {{ spire_namespace }} get pods -l app=spire-server --no-headers -o custom-columns=NAME:.metadata.name"
+      register: __spire_pod
+      changed_when: false
+
+    - name: Get Vault pod
+      ansible.builtin.command:
+        cmd: "oc -n {{ vault_namespace }} get pods -l app=vault --no-headers -o custom-columns=NAME:.metadata.name"
+      register: __vault_pod
+      changed_when: false
+
+    - name: "DEMO: Show registered SPIFFE IDs"
+      ansible.builtin.command:
+        cmd: >-
+          oc exec -n {{ spire_namespace }} {{ __spire_pod.stdout_lines[0] }} --
+          /opt/spire/bin/spire-server entry show
+      register: __entries
+      changed_when: false
+
+    - name: Display SPIFFE entries
+      ansible.builtin.debug:
+        msg: "{{ __entries.stdout_lines }}"
+
+    - name: "DEMO: Fetch JWT-SVID for AAP platform identity"
+      ansible.builtin.shell:
+        cmd: |
+          # Create a one-shot pod that fetches a JWT-SVID and authenticates to Vault
+          oc run spiffe-demo --rm -i --restart=Never \
+            --namespace={{ aap_namespace }} \
+            --image=registry.access.redhat.com/ubi9/python-311:latest \
+            --overrides='{
+              "spec": {
+                "containers": [{
+                  "name": "spiffe-demo",
+                  "image": "registry.access.redhat.com/ubi9/python-311:latest",
+                  "command": ["python3", "-c", "
+import json, os, ssl, sys
+from urllib.request import Request, urlopen
+from urllib.error import HTTPError
+
+vault_url = \"http://vault.{{ vault_namespace }}.svc.cluster.local:8200\"
+jwt_file = \"/svids/jwt.token\"
+
+# Read the JWT-SVID
+with open(jwt_file) as f:
+    jwt = f.read().strip()
+
+# Show JWT claims (middle segment)
+import base64
+claims_b64 = jwt.split(\".\")[1] + \"===\"
+claims = json.loads(base64.urlsafe_b64decode(claims_b64))
+print(\"\\n=== JWT-SVID Claims ===\")
+print(json.dumps(claims, indent=2))
+
+# Authenticate to Vault
+ctx = ssl.create_default_context()
+ctx.check_hostname = False
+ctx.verify_mode = ssl.CERT_NONE
+data = json.dumps({\"role\": \"aap-platform\", \"jwt\": jwt}).encode()
+req = Request(f\"{vault_url}/v1/auth/jwt/login\", data=data, method=\"POST\")
+req.add_header(\"Content-Type\", \"application/json\")
+resp = urlopen(req, context=ctx, timeout=10)
+auth = json.loads(resp.read())[\"auth\"]
+print(\"\\n=== Vault Token ===\")
+print(f\"  Token: {auth[\"client_token\"][:20]}...\")
+print(f\"  Policies: {auth[\"token_policies\"]}\")
+print(f\"  TTL: {auth[\"lease_duration\"]}s\")
+
+# Read a secret
+req2 = Request(f\"{vault_url}/v1/secret/data/hub/aap/config\")
+req2.add_header(\"X-Vault-Token\", auth[\"client_token\"])
+resp2 = urlopen(req2, context=ctx, timeout=10)
+secret = json.loads(resp2.read())[\"data\"][\"data\"]
+print(\"\\n=== Secret Retrieved ===\")
+for k, v in secret.items():
+    print(f\"  {k}: {v}\")
+
+# Try to read org secrets (should fail - least privilege)
+print(\"\\n=== Least Privilege Test ===\")
+try:
+    req3 = Request(f\"{vault_url}/v1/secret/data/aap/org/infra-corp/credentials\")
+    req3.add_header(\"X-Vault-Token\", auth[\"client_token\"])
+    urlopen(req3, context=ctx, timeout=10)
+    print(\"  FAIL: Platform token could read org secrets!\")
+except HTTPError as e:
+    print(f\"  PASS: Org secrets blocked ({e.code} - permission denied)\")
+    print(\"  Platform identity can only access hub/aap/* paths.\")
+"],
+                  "volumeMounts": [
+                    {"name": "svids", "mountPath": "/svids"}
+                  ]
+                }],
+                "initContainers": [{
+                  "name": "fetch-jwt",
+                  "image": "{{ spire_helper_image }}",
+                  "args": ["-config", "/config/helper.conf", "-exitWhenReady"],
+                  "volumeMounts": [
+                    {"name": "spire-socket", "mountPath": "/run/spire/sockets", "readOnly": true},
+                    {"name": "svids", "mountPath": "/svids"},
+                    {"name": "helper-config", "mountPath": "/config", "readOnly": true}
+                  ]
+                }],
+                "volumes": [
+                  {"name": "spire-socket", "hostPath": {"path": "/run/spire/sockets", "type": "Directory"}},
+                  {"name": "svids", "emptyDir": {}},
+                  {"name": "helper-config", "configMap": {"name": "spiffe-helper-config"}}
+                ]
+              }
+            }'
+        executable: /bin/bash
+      register: __demo_output
+      changed_when: false
+      failed_when: false
+
+    - name: Display demo output
+      ansible.builtin.debug:
+        msg: "{{ __demo_output.stdout_lines | default(['(no output - check pod logs)']) }}"
+
+    - name: "DEMO: Revocation test"
+      ansible.builtin.pause:
+        prompt: |
+          ═══════════════════════════════════════════════════════
+           REVOCATION: Delete the SPIRE entry and retry.
+           The Vault login will fail immediately.
+           Re-add the entry, it works again.
+           No tokens to hunt. No rotation cascade.
+          ═══════════════════════════════════════════════════════
+          Press ENTER to continue to Scenario 2...
+
+# ============================================================
+# Scenario 2: Multi-Org Secret Isolation
+# "Each AAP org can only access its own Vault path"
+# ============================================================
+- name: "Scenario 2: Multi-Org Secret Isolation"
+  hosts: localhost
+  gather_facts: false
+  connection: local
+  tags: [scenario2]
+  environment:
+    KUBECONFIG: "{{ kubeconfig }}"
+  tasks:
+    - name: "DEMO: Multi-org isolation"
+      ansible.builtin.pause:
+        prompt: |
+          ╔══════════════════════════════════════════════════════════════╗
+          ║  SCENARIO 2: Multi-Org Secret Isolation                    ║
+          ╠══════════════════════════════════════════════════════════════╣
+          ║                                                            ║
+          ║  AAP has 4 organizations:                                  ║
+          ║    - Infra-Corp      -> secret/aap/org/infra-corp/*        ║
+          ║    - AppDev-Squad    -> secret/aap/org/appdev-squad/*      ║
+          ║    - SecOps-Team     -> secret/aap/org/secops-team/*       ║
+          ║    - Platform-Ops    -> secret/aap/org/platform-ops/*      ║
+          ║                                                            ║
+          ║  Each org has its own SPIFFE ID and Vault role.            ║
+          ║  Infra-Corp CANNOT read AppDev-Squad's secrets.            ║
+          ║                                                            ║
+          ╚══════════════════════════════════════════════════════════════╝
+          Press ENTER to begin...
+
+    - name: Get Vault pod
+      ansible.builtin.command:
+        cmd: "oc -n {{ vault_namespace }} get pods -l app=vault --no-headers -o custom-columns=NAME:.metadata.name"
+      register: __vault_pod
+      changed_when: false
+
+    - name: "DEMO: Show Vault policies for each org"
+      ansible.builtin.command:
+        cmd: >-
+          oc exec -n {{ vault_namespace }} {{ __vault_pod.stdout_lines[0] }} --
+          vault policy read {{ item }}
+      loop:
+        - aap-org-infra-corp-secret
+        - aap-org-appdev-squad-secret
+      register: __policies
+      changed_when: false
+
+    - name: Display policies
+      ansible.builtin.debug:
+        msg: |
+          Policy: {{ item.item }}
+          {{ item.stdout }}
+      loop: "{{ __policies.results }}"
+
+    - name: "DEMO: Show Vault JWT roles for each org"
+      ansible.builtin.command:
+        cmd: >-
+          oc exec -n {{ vault_namespace }} {{ __vault_pod.stdout_lines[0] }} --
+          vault read auth/jwt/role/{{ item }}
+      loop:
+        - aap-org-infra-corp
+        - aap-org-appdev-squad
+      register: __roles
+      changed_when: false
+
+    - name: Display roles
+      ansible.builtin.debug:
+        msg: |
+          Role: {{ item.item }}
+          {{ item.stdout }}
+      loop: "{{ __roles.results }}"
+
+    - name: "DEMO: Each org's secrets are isolated"
+      ansible.builtin.debug:
+        msg: |
+          When Infra-Corp authenticates with its SPIFFE ID:
+            spiffe://{{ spire_trust_domain }}/ns/{{ aap_namespace }}/org/infra-corp
+          
+          It gets a Vault token with policy: aap-org-infra-corp-secret
+          Which only allows: secret/data/aap/org/infra-corp/*
+          
+          Trying to read secret/data/aap/org/appdev-squad/* returns 403.
+          
+          This maps to AAP's organization model:
+          - Each org's credential lookups are scoped to their own Vault path
+          - An org admin cannot access another org's secrets
+          - No shared tokens between organizations
+
+    - name: Continue to scenario 3
+      ansible.builtin.pause:
+        prompt: "Press ENTER to continue to Scenario 3..."
+
+# ============================================================
+# Scenario 3: EDA Dynamic Credentials
+# "EDA pulls cloud credentials at event time, not stored in AAP"
+# ============================================================
+- name: "Scenario 3: EDA Dynamic Credentials"
+  hosts: localhost
+  gather_facts: false
+  connection: local
+  tags: [scenario3]
+  environment:
+    KUBECONFIG: "{{ kubeconfig }}"
+  tasks:
+    - name: "DEMO: EDA dynamic credentials"
+      ansible.builtin.pause:
+        prompt: |
+          ╔══════════════════════════════════════════════════════════════╗
+          ║  SCENARIO 3: EDA Dynamic Credentials                       ║
+          ╠══════════════════════════════════════════════════════════════╣
+          ║                                                            ║
+          ║  Scenario: PagerDuty alert triggers EDA rulebook.          ║
+          ║  The rulebook needs AWS credentials to remediate.          ║
+          ║                                                            ║
+          ║  BEFORE: AWS creds stored as static AAP credential.        ║
+          ║  AFTER: EDA's SPIFFE identity fetches AWS creds from       ║
+          ║         Vault at event time. Creds are never stored.       ║
+          ║                                                            ║
+          ║  Path: secret/aap/eda/webhook-credentials                  ║
+          ║  Contains: pagerduty_api_key, aws_access_key, aws_secret   ║
+          ║                                                            ║
+          ╚══════════════════════════════════════════════════════════════╝
+          Press ENTER to begin...
+
+    - name: Get Vault pod
+      ansible.builtin.command:
+        cmd: "oc -n {{ vault_namespace }} get pods -l app=vault --no-headers -o custom-columns=NAME:.metadata.name"
+      register: __vault_pod
+      changed_when: false
+
+    - name: "DEMO: Show the EDA webhook secrets in Vault"
+      ansible.builtin.command:
+        cmd: >-
+          oc exec -n {{ vault_namespace }} {{ __vault_pod.stdout_lines[0] }} --
+          vault kv get secret/aap/eda/webhook-credentials
+      register: __eda_secrets
+      changed_when: false
+
+    - name: Display EDA secrets
+      ansible.builtin.debug:
+        msg: "{{ __eda_secrets.stdout_lines }}"
+
+    - name: "DEMO: EDA credential flow explanation"
+      ansible.builtin.debug:
+        msg: |
+          EDA Dynamic Credential Flow:
+          
+          1. PagerDuty sends webhook to EDA controller
+          2. Rulebook activation starts
+          3. EDA pod's spiffe-helper sidecar fetches JWT-SVID:
+             Subject: spiffe://{{ spire_trust_domain }}/ns/{{ aap_namespace }}/sa/aap-controller
+          4. spiffe-vault-client exchanges JWT for Vault token
+          5. Vault token reads secret/aap/eda/webhook-credentials
+          6. AWS credentials injected into the remediation playbook
+          7. Playbook runs, remediates the issue
+          8. JWT-SVID expires in 5 minutes
+          9. Vault token expires in 1 hour
+          10. AWS credentials are never persisted in AAP
+          
+          Zero stored secrets. Every credential has a cryptographic audit trail.
+
+    - name: "DEMO: Complete"
+      ansible.builtin.debug:
+        msg: |
+          ════════════════════════════════════════════════════
+           POC Demo Complete
+          ════════════════════════════════════════════════════
+          
+          Three scenarios demonstrated:
+          
+          1. Platform Identity: Root Vault token replaced with
+             SPIFFE JWT. Least-privilege, auto-rotating.
+          
+          2. Multi-Org Isolation: Each AAP org has its own
+             SPIFFE ID and Vault policy. Cross-org access denied.
+          
+          3. EDA Dynamic Creds: Event-driven credential retrieval.
+             No stored secrets, full audit trail.
+          
+          Next steps:
+          - Contribute AAP integration to layered-zero-trust pattern
+          - Engage Martin Jackson and Andrew Block for upstream PR
+          - Adapt for ZTWIM operator (OCP productized SPIRE)

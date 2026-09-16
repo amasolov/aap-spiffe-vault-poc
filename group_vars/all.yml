@@ -1,0 +1,65 @@
+---
+# ============================================================
+# AAP SPIFFE/Vault POC - Global Variables
+# ============================================================
+
+# Cluster
+cluster_domain: "apps.hosted-1.alexeym.apac.sysmgmt.cee.redhat.com"
+kubeconfig: "{{ lookup('env', 'KUBECONFIG') | default('~/.kube/config', true) }}"
+
+# SPIRE
+spire_namespace: spire-system
+spire_trust_domain: "{{ cluster_domain }}"
+spire_server_image: "ghcr.io/spiffe/spire-server:1.12.0"
+spire_agent_image: "ghcr.io/spiffe/spire-agent:1.12.0"
+spire_oidc_image: "ghcr.io/spiffe/oidc-discovery-provider:1.12.0"
+spire_helper_image: "ghcr.io/spiffe/spiffe-helper:0.8.0"
+
+# Vault
+vault_namespace: vault
+vault_version: "1.17.2"
+vault_image: "hashicorp/vault:{{ vault_version }}"
+vault_route: "vault.{{ cluster_domain }}"
+vault_internal_url: "https://vault.{{ vault_namespace }}.svc.cluster.local:8200"
+
+# AAP
+aap_namespace: aap
+aap_cr_name: aap
+aap_route: "aap-aap.{{ cluster_domain }}"
+
+# SPIFFE IDs for AAP components
+aap_spiffe_ids:
+  platform:
+    spiffe_id: "spiffe://{{ spire_trust_domain }}/ns/{{ aap_namespace }}/sa/aap-controller"
+    vault_role: aap-platform
+    vault_policy: aap-platform-secret
+    vault_paths:
+      - "secret/data/hub/aap/*"
+      - "secret/data/global/*"
+  infra_corp:
+    spiffe_id: "spiffe://{{ spire_trust_domain }}/ns/{{ aap_namespace }}/org/infra-corp"
+    vault_role: aap-org-infra-corp
+    vault_policy: aap-org-infra-corp-secret
+    vault_paths:
+      - "secret/data/aap/org/infra-corp/*"
+  appdev_squad:
+    spiffe_id: "spiffe://{{ spire_trust_domain }}/ns/{{ aap_namespace }}/org/appdev-squad"
+    vault_role: aap-org-appdev-squad
+    vault_policy: aap-org-appdev-squad-secret
+    vault_paths:
+      - "secret/data/aap/org/appdev-squad/*"
+  secops_team:
+    spiffe_id: "spiffe://{{ spire_trust_domain }}/ns/{{ aap_namespace }}/org/secops-team"
+    vault_role: aap-org-secops-team
+    vault_policy: aap-org-secops-team-secret
+    vault_paths:
+      - "secret/data/aap/org/secops-team/*"
+  platform_ops:
+    spiffe_id: "spiffe://{{ spire_trust_domain }}/ns/{{ aap_namespace }}/org/platform-ops"
+    vault_role: aap-org-platform-ops
+    vault_policy: aap-org-platform-ops-secret
+    vault_paths:
+      - "secret/data/aap/org/platform-ops/*"
+
+# Vault JWT auth
+vault_jwt_audience: "vault.{{ cluster_domain }}"

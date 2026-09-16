@@ -1,0 +1,78 @@
+---
+# Teardown AAP SPIFFE/Vault POC
+#
+# Removes SPIRE, Vault, and integration resources.
+# Does NOT touch the existing AAP deployment.
+#
+# Usage:
+#   ansible-playbook teardown-poc.yml
+#   ansible-playbook teardown-poc.yml --tags spire    # SPIRE only
+#   ansible-playbook teardown-poc.yml --tags vault    # Vault only
+
+- name: "Teardown POC resources"
+  hosts: localhost
+  gather_facts: false
+  connection: local
+  environment:
+    KUBECONFIG: "{{ kubeconfig }}"
+  tasks:
+    # --- Clean AAP namespace of POC resources ---
+    - name: Delete SPIFFE integration resources from AAP namespace
+      kubernetes.core.k8s:
+        state: absent
+        kind: "{{ item.kind }}"
+        name: "{{ item.name }}"
+        namespace: "{{ aap_namespace }}"
+        api_version: "{{ item.api | default('v1') }}"
+      loop:
+        - { kind: CronJob, name: spiffe-vault-credential-sync, api: batch/v1 }
+        - { kind: ConfigMap, name: spiffe-vault-client }
+        - { kind: ConfigMap, name: spiffe-helper-config }
+      ignore_errors: true
+      tags: [aap, always]
+
+    # --- Delete SPIRE ---
+    - name: Delete SPIRE ClusterRoleBindings
+      kubernetes.core.k8s:
+        state: absent
+        kind: ClusterRoleBinding
+        name: "{{ item }}"
+        api_version: rbac.authorization.k8s.io/v1
+      loop:
+        - spire-server
+        - spire-agent
+      ignore_errors: true
+      tags: [spire]
+
+    - name: Delete SPIRE ClusterRoles
+      kubernetes.core.k8s:
+        state: absent
+        kind: ClusterRole
+        name: "{{ item }}"
+        api_version: rbac.authorization.k8s.io/v1
+      loop:
+        - spire-server
+        - spire-agent
+      ignore_errors: true
+      tags: [spire]
+
+    - name: Delete SPIRE namespace
+      kubernetes.core.k8s:
+        state: absent
+        kind: Namespace
+        name: "{{ spire_namespace }}"
+      ignore_errors: true
+      tags: [spire]
+
+    # --- Delete Vault ---
+    - name: Delete Vault namespace
+      kubernetes.core.k8s:
+        state: absent
+        kind: Namespace
+        name: "{{ vault_namespace }}"
+      ignore_errors: true
+      tags: [vault]
+
+    - name: Teardown complete
+      ansible.builtin.debug:
+        msg: "POC resources removed. AAP deployment in {{ aap_namespace }} is untouched."

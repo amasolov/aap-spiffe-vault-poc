@@ -1,0 +1,900 @@
+---
+# AAP SPIFFE/Vault POC - Full Deployment
+#
+# Deploys SPIRE, Vault, and wires SPIFFE JWT auth on an OCP cluster
+# that already has AAP 2.7 running.
+#
+# Prerequisites:
+#   - OCP cluster with AAP 2.7 deployed (namespace: aap)
+#   - oc CLI authenticated to the cluster
+#   - helm CLI available
+#
+# Usage:
+#   ansible-playbook deploy-poc.yml                           # full deploy
+#   ansible-playbook deploy-poc.yml --tags spire              # SPIRE only
+#   ansible-playbook deploy-poc.yml --tags vault              # Vault only
+#   ansible-playbook deploy-poc.yml --tags integrate          # wire SPIFFE+Vault
+#   ansible-playbook deploy-poc.yml --tags aap                # configure AAP
+#
+# Variables (override with -e):
+#   kubeconfig:    path to kubeconfig (default: KUBECONFIG env or ~/.kube/config)
+#   aap_namespace: AAP namespace (default: aap)
+
+# ============================================================
+# Phase 1: Deploy SPIRE (server + agent + OIDC discovery)
+# ============================================================
+- name: "Deploy SPIRE"
+  hosts: localhost
+  gather_facts: false
+  connection: local
+  tags: [spire]
+  environment:
+    KUBECONFIG: "{{ kubeconfig }}"
+  tasks:
+    - name: Create SPIRE namespace
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Namespace
+          metadata:
+            name: "{{ spire_namespace }}"
+
+    # --- SPIRE Server ---
+    - name: Deploy SPIRE Server ConfigMap
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: v1
+          kind: ConfigMap
+          metadata:
+            name: spire-server-config
+            namespace: "{{ spire_namespace }}"
+          data:
+            server.conf: |
+              server {
+                bind_address = "0.0.0.0"
+                bind_port = "8081"
+                trust_domain = "{{ spire_trust_domain }}"
+                data_dir = "/run/spire/data"
+                log_level = "INFO"
+                ca_ttl = "24h"
+                default_x509_svid_ttl = "1h"
+                default_jwt_svid_ttl = "5m"
+
+                ca_subject {
+                  country = ["AU"]
+                  organization = ["AAP SPIFFE POC"]
+                  common_name = ""
+                }
+
+                jwt_issuer = "https://oidc-discovery-{{ spire_namespace }}.{{ cluster_domain }}"
+              }
+
+              plugins {
+                DataStore "sql" {
+                  plugin_data {
+                    database_type = "sqlite3"
+                    connection_string = "/run/spire/data/datastore.sqlite3"
+                  }
+                }
+
+                NodeAttestor "k8s_psat" {
+                  plugin_data {
+                    clusters = {
+                      "hosted-1" = {
+                        service_account_allow_list = ["{{ spire_namespace }}:spire-agent"]
+                      }
+                    }
+                  }
+                }
+
+                KeyManager "disk" {
+                  plugin_data {
+                    keys_path = "/run/spire/data/keys.json"
+                  }
+                }
+              }
+
+    - name: Deploy SPIRE Server ServiceAccount
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: v1
+          kind: ServiceAccount
+          metadata:
+            name: spire-server
+            namespace: "{{ spire_namespace }}"
+
+    - name: Deploy SPIRE Server ClusterRole
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: rbac.authorization.k8s.io/v1
+          kind: ClusterRole
+          metadata:
+            name: spire-server
+          rules:
+            - apiGroups: [""]
+              resources: ["pods", "nodes"]
+              verbs: ["get", "list", "watch"]
+            - apiGroups: ["authentication.k8s.io"]
+              resources: ["tokenreviews"]
+              verbs: ["create"]
+
+    - name: Deploy SPIRE Server ClusterRoleBinding
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: rbac.authorization.k8s.io/v1
+          kind: ClusterRoleBinding
+          metadata:
+            name: spire-server
+          roleRef:
+            apiGroup: rbac.authorization.k8s.io
+            kind: ClusterRole
+            name: spire-server
+          subjects:
+            - kind: ServiceAccount
+              name: spire-server
+              namespace: "{{ spire_namespace }}"
+
+    - name: Deploy SPIRE Server StatefulSet
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: apps/v1
+          kind: StatefulSet
+          metadata:
+            name: spire-server
+            namespace: "{{ spire_namespace }}"
+          spec:
+            replicas: 1
+            selector:
+              matchLabels:
+                app: spire-server
+            serviceName: spire-server
+            template:
+              metadata:
+                labels:
+                  app: spire-server
+              spec:
+                serviceAccountName: spire-server
+                containers:
+                  - name: spire-server
+                    image: "{{ spire_server_image }}"
+                    args: ["-config", "/run/spire/config/server.conf"]
+                    ports:
+                      - containerPort: 8081
+                        name: grpc
+                    volumeMounts:
+                      - name: config
+                        mountPath: /run/spire/config
+                        readOnly: true
+                      - name: data
+                        mountPath: /run/spire/data
+                    livenessProbe:
+                      exec:
+                        command:
+                          - /opt/spire/bin/spire-server
+                          - healthcheck
+                      initialDelaySeconds: 15
+                      periodSeconds: 30
+                    readinessProbe:
+                      exec:
+                        command:
+                          - /opt/spire/bin/spire-server
+                          - healthcheck
+                      initialDelaySeconds: 10
+                      periodSeconds: 10
+                volumes:
+                  - name: config
+                    configMap:
+                      name: spire-server-config
+            volumeClaimTemplates:
+              - metadata:
+                  name: data
+                spec:
+                  accessModes: ["ReadWriteOnce"]
+                  resources:
+                    requests:
+                      storage: 1Gi
+
+    - name: Deploy SPIRE Server Service
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: spire-server
+            namespace: "{{ spire_namespace }}"
+          spec:
+            selector:
+              app: spire-server
+            ports:
+              - port: 8081
+                targetPort: 8081
+                name: grpc
+
+    # --- SPIRE Agent ---
+    - name: Deploy SPIRE Agent ConfigMap
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: v1
+          kind: ConfigMap
+          metadata:
+            name: spire-agent-config
+            namespace: "{{ spire_namespace }}"
+          data:
+            agent.conf: |
+              agent {
+                data_dir = "/run/spire"
+                log_level = "INFO"
+                server_address = "spire-server"
+                server_port = "8081"
+                socket_path = "/run/spire/sockets/agent.sock"
+                trust_domain = "{{ spire_trust_domain }}"
+              }
+
+              plugins {
+                NodeAttestor "k8s_psat" {
+                  plugin_data {
+                    cluster = "hosted-1"
+                  }
+                }
+
+                KeyManager "memory" {
+                  plugin_data {}
+                }
+
+                WorkloadAttestor "k8s" {
+                  plugin_data {
+                    skip_kubelet_verification = true
+                  }
+                }
+              }
+
+    - name: Deploy SPIRE Agent ServiceAccount
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: v1
+          kind: ServiceAccount
+          metadata:
+            name: spire-agent
+            namespace: "{{ spire_namespace }}"
+
+    - name: Deploy SPIRE Agent ClusterRole
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: rbac.authorization.k8s.io/v1
+          kind: ClusterRole
+          metadata:
+            name: spire-agent
+          rules:
+            - apiGroups: [""]
+              resources: ["pods", "nodes", "nodes/proxy"]
+              verbs: ["get", "list"]
+
+    - name: Deploy SPIRE Agent ClusterRoleBinding
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: rbac.authorization.k8s.io/v1
+          kind: ClusterRoleBinding
+          metadata:
+            name: spire-agent
+          roleRef:
+            apiGroup: rbac.authorization.k8s.io
+            kind: ClusterRole
+            name: spire-agent
+          subjects:
+            - kind: ServiceAccount
+              name: spire-agent
+              namespace: "{{ spire_namespace }}"
+
+    - name: Deploy SPIRE Agent DaemonSet
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: apps/v1
+          kind: DaemonSet
+          metadata:
+            name: spire-agent
+            namespace: "{{ spire_namespace }}"
+          spec:
+            selector:
+              matchLabels:
+                app: spire-agent
+            template:
+              metadata:
+                labels:
+                  app: spire-agent
+              spec:
+                serviceAccountName: spire-agent
+                hostPID: true
+                hostNetwork: true
+                dnsPolicy: ClusterFirstWithHostNet
+                containers:
+                  - name: spire-agent
+                    image: "{{ spire_agent_image }}"
+                    args: ["-config", "/run/spire/config/agent.conf"]
+                    securityContext:
+                      privileged: true
+                    volumeMounts:
+                      - name: config
+                        mountPath: /run/spire/config
+                        readOnly: true
+                      - name: spire-agent-socket
+                        mountPath: /run/spire/sockets
+                    livenessProbe:
+                      exec:
+                        command:
+                          - /opt/spire/bin/spire-agent
+                          - healthcheck
+                          - -socketPath
+                          - /run/spire/sockets/agent.sock
+                      initialDelaySeconds: 15
+                      periodSeconds: 30
+                    readinessProbe:
+                      exec:
+                        command:
+                          - /opt/spire/bin/spire-agent
+                          - healthcheck
+                          - -socketPath
+                          - /run/spire/sockets/agent.sock
+                      initialDelaySeconds: 10
+                      periodSeconds: 10
+                volumes:
+                  - name: config
+                    configMap:
+                      name: spire-agent-config
+                  - name: spire-agent-socket
+                    hostPath:
+                      path: /run/spire/sockets
+                      type: DirectoryOrCreate
+
+    # --- OIDC Discovery Provider ---
+    - name: Deploy OIDC Discovery Provider ConfigMap
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: v1
+          kind: ConfigMap
+          metadata:
+            name: oidc-discovery-provider-config
+            namespace: "{{ spire_namespace }}"
+          data:
+            oidc-discovery-provider.conf: |
+              log_level = "INFO"
+              domains = ["oidc-discovery-{{ spire_namespace }}.{{ cluster_domain }}"]
+              allow_insecure_scheme = true
+              insecure_addr = ":8080"
+
+              workload_api {
+                socket_path = "/run/spire/sockets/agent.sock"
+                trust_domain = "{{ spire_trust_domain }}"
+              }
+
+              health_checks {
+                bind_port = "8008"
+                ready_path = "/ready"
+                live_path = "/live"
+              }
+
+    - name: Deploy OIDC Discovery Provider Deployment
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: oidc-discovery-provider
+            namespace: "{{ spire_namespace }}"
+          spec:
+            replicas: 1
+            selector:
+              matchLabels:
+                app: oidc-discovery-provider
+            template:
+              metadata:
+                labels:
+                  app: oidc-discovery-provider
+              spec:
+                containers:
+                  - name: oidc-discovery-provider
+                    image: "{{ spire_oidc_image }}"
+                    args:
+                      - "-config"
+                      - "/run/spire/config/oidc-discovery-provider.conf"
+                    ports:
+                      - containerPort: 8080
+                        name: http
+                      - containerPort: 8008
+                        name: health
+                    volumeMounts:
+                      - name: config
+                        mountPath: /run/spire/config
+                        readOnly: true
+                      - name: spire-agent-socket
+                        mountPath: /run/spire/sockets
+                        readOnly: true
+                    readinessProbe:
+                      httpGet:
+                        path: /ready
+                        port: 8008
+                      initialDelaySeconds: 5
+                      periodSeconds: 10
+                    livenessProbe:
+                      httpGet:
+                        path: /live
+                        port: 8008
+                      initialDelaySeconds: 10
+                      periodSeconds: 30
+                volumes:
+                  - name: config
+                    configMap:
+                      name: oidc-discovery-provider-config
+                  - name: spire-agent-socket
+                    hostPath:
+                      path: /run/spire/sockets
+                      type: Directory
+
+    - name: Deploy OIDC Discovery Provider Service
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: oidc-discovery
+            namespace: "{{ spire_namespace }}"
+          spec:
+            selector:
+              app: oidc-discovery-provider
+            ports:
+              - port: 80
+                targetPort: 8080
+                name: http
+
+    - name: Deploy OIDC Discovery Provider Route
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: route.openshift.io/v1
+          kind: Route
+          metadata:
+            name: oidc-discovery
+            namespace: "{{ spire_namespace }}"
+          spec:
+            host: "oidc-discovery-{{ spire_namespace }}.{{ cluster_domain }}"
+            to:
+              kind: Service
+              name: oidc-discovery
+            port:
+              targetPort: http
+            tls:
+              termination: edge
+              insecureEdgeTerminationPolicy: Redirect
+
+    - name: Wait for SPIRE Server to be ready
+      kubernetes.core.k8s_info:
+        api_version: apps/v1
+        kind: StatefulSet
+        name: spire-server
+        namespace: "{{ spire_namespace }}"
+      register: __spire_server
+      retries: 30
+      delay: 10
+      until: >-
+        __spire_server.resources | length > 0 and
+        (__spire_server.resources[0].status.readyReplicas | default(0)) >= 1
+
+    - name: Wait for SPIRE Agent to be ready
+      ansible.builtin.shell:
+        cmd: >-
+          oc -n {{ spire_namespace }} get ds spire-agent
+          -o jsonpath='{.status.numberReady}' 2>/dev/null || echo 0
+        executable: /bin/bash
+      register: __agent_ready
+      changed_when: false
+      retries: 30
+      delay: 10
+      until: __agent_ready.stdout | int > 0
+
+    - name: Get SPIRE Server pod name
+      ansible.builtin.command:
+        cmd: "oc -n {{ spire_namespace }} get pods -l app=spire-server --no-headers -o custom-columns=NAME:.metadata.name"
+      register: __spire_server_pod
+      changed_when: false
+
+    # --- Register workload entries for AAP ---
+    - name: Register AAP platform SPIFFE ID
+      ansible.builtin.command:
+        cmd: >-
+          oc exec -n {{ spire_namespace }} {{ __spire_server_pod.stdout_lines[0] }} --
+          /opt/spire/bin/spire-server entry create
+          -spiffeID {{ item.value.spiffe_id }}
+          -parentID spiffe://{{ spire_trust_domain }}/spire/agent/k8s_psat/hosted-1
+          -selector k8s:ns:{{ aap_namespace }}
+          -dns {{ item.key }}.{{ aap_namespace }}.svc.cluster.local
+      loop: "{{ aap_spiffe_ids | dict2items }}"
+      register: __entry_create
+      changed_when: "'Entry ID' in __entry_create.stdout"
+      failed_when: false
+
+    - name: SPIRE deployment complete
+      ansible.builtin.debug:
+        msg: >-
+          SPIRE deployed in {{ spire_namespace }}.
+          OIDC Discovery: https://oidc-discovery-{{ spire_namespace }}.{{ cluster_domain }}
+          Registered {{ aap_spiffe_ids | length }} SPIFFE IDs for AAP.
+
+# ============================================================
+# Phase 2: Deploy Vault (dev mode for POC)
+# ============================================================
+- name: "Deploy Vault"
+  hosts: localhost
+  gather_facts: false
+  connection: local
+  tags: [vault]
+  environment:
+    KUBECONFIG: "{{ kubeconfig }}"
+  tasks:
+    - name: Create Vault namespace
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Namespace
+          metadata:
+            name: "{{ vault_namespace }}"
+
+    - name: Deploy Vault in dev mode
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: vault
+            namespace: "{{ vault_namespace }}"
+          spec:
+            replicas: 1
+            selector:
+              matchLabels:
+                app: vault
+            template:
+              metadata:
+                labels:
+                  app: vault
+              spec:
+                containers:
+                  - name: vault
+                    image: "{{ vault_image }}"
+                    command: ["vault", "server", "-dev", "-dev-listen-address=0.0.0.0:8200", "-dev-root-token-id=root"]
+                    ports:
+                      - containerPort: 8200
+                        name: http
+                    env:
+                      - name: VAULT_ADDR
+                        value: "http://127.0.0.1:8200"
+                      - name: VAULT_DEV_ROOT_TOKEN_ID
+                        value: "root"
+                    readinessProbe:
+                      httpGet:
+                        path: /v1/sys/health
+                        port: 8200
+                      initialDelaySeconds: 5
+                      periodSeconds: 10
+
+    - name: Deploy Vault Service
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: vault
+            namespace: "{{ vault_namespace }}"
+          spec:
+            selector:
+              app: vault
+            ports:
+              - port: 8200
+                targetPort: 8200
+                name: http
+
+    - name: Deploy Vault Route
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: route.openshift.io/v1
+          kind: Route
+          metadata:
+            name: vault
+            namespace: "{{ vault_namespace }}"
+          spec:
+            host: "{{ vault_route }}"
+            to:
+              kind: Service
+              name: vault
+            port:
+              targetPort: http
+            tls:
+              termination: edge
+              insecureEdgeTerminationPolicy: Redirect
+
+    - name: Wait for Vault to be ready
+      kubernetes.core.k8s_info:
+        api_version: apps/v1
+        kind: Deployment
+        name: vault
+        namespace: "{{ vault_namespace }}"
+      register: __vault_deploy
+      retries: 30
+      delay: 10
+      until: >-
+        __vault_deploy.resources | length > 0 and
+        (__vault_deploy.resources[0].status.readyReplicas | default(0)) >= 1
+
+    - name: Get Vault pod name
+      ansible.builtin.command:
+        cmd: "oc -n {{ vault_namespace }} get pods -l app=vault --no-headers -o custom-columns=NAME:.metadata.name"
+      register: __vault_pod
+      changed_when: false
+
+    # --- Seed demo secrets for each org ---
+    - name: Enable KV v2 secrets engine
+      ansible.builtin.command:
+        cmd: >-
+          oc exec -n {{ vault_namespace }} {{ __vault_pod.stdout_lines[0] }} --
+          vault secrets enable -version=2 -path=secret kv
+      register: __kv_enable
+      changed_when: "'Success' in __kv_enable.stdout"
+      failed_when: false
+
+    - name: Seed platform secrets
+      ansible.builtin.command:
+        cmd: >-
+          oc exec -n {{ vault_namespace }} {{ __vault_pod.stdout_lines[0] }} --
+          vault kv put secret/hub/aap/config
+          admin_token=spiffe-rotated-token-$(date +%s)
+          db_password=aap-db-secret-from-vault
+      changed_when: true
+
+    - name: Seed org-scoped secrets
+      ansible.builtin.command:
+        cmd: >-
+          oc exec -n {{ vault_namespace }} {{ __vault_pod.stdout_lines[0] }} --
+          vault kv put secret/aap/org/{{ item.org }}/credentials
+          ssh_key="org-{{ item.org }}-ssh-private-key"
+          api_token="org-{{ item.org }}-cloud-api-token-$(date +%s)"
+          cloud_password="org-{{ item.org }}-cloud-password"
+      loop:
+        - { org: infra-corp }
+        - { org: appdev-squad }
+        - { org: secops-team }
+        - { org: platform-ops }
+      changed_when: true
+
+    - name: Seed EDA webhook secret
+      ansible.builtin.command:
+        cmd: >-
+          oc exec -n {{ vault_namespace }} {{ __vault_pod.stdout_lines[0] }} --
+          vault kv put secret/aap/eda/webhook-credentials
+          pagerduty_api_key="eda-pagerduty-key-rotated-$(date +%s)"
+          aws_access_key="eda-aws-access-key"
+          aws_secret_key="eda-aws-secret-rotated-$(date +%s)"
+      changed_when: true
+
+    - name: Vault deployment complete
+      ansible.builtin.debug:
+        msg: >-
+          Vault deployed at https://{{ vault_route }} (dev mode, root token: root).
+          Seeded secrets for platform, 4 orgs, and EDA.
+
+# ============================================================
+# Phase 3: Wire SPIFFE JWT auth in Vault
+# ============================================================
+- name: "Integrate SPIFFE + Vault"
+  hosts: localhost
+  gather_facts: false
+  connection: local
+  tags: [integrate]
+  environment:
+    KUBECONFIG: "{{ kubeconfig }}"
+  tasks:
+    - name: Get Vault pod name
+      ansible.builtin.command:
+        cmd: "oc -n {{ vault_namespace }} get pods -l app=vault --no-headers -o custom-columns=NAME:.metadata.name"
+      register: __vault_pod
+      changed_when: false
+
+    - name: Enable JWT auth method
+      ansible.builtin.command:
+        cmd: >-
+          oc exec -n {{ vault_namespace }} {{ __vault_pod.stdout_lines[0] }} --
+          vault auth enable jwt
+      register: __jwt_enable
+      changed_when: "'Success' in __jwt_enable.stdout"
+      failed_when: false
+
+    - name: Configure JWT auth with SPIRE OIDC discovery
+      ansible.builtin.command:
+        cmd: >-
+          oc exec -n {{ vault_namespace }} {{ __vault_pod.stdout_lines[0] }} --
+          vault write auth/jwt/config
+          oidc_discovery_url=https://oidc-discovery-{{ spire_namespace }}.{{ cluster_domain }}
+          default_role=aap-platform
+      register: __jwt_config
+      changed_when: "'Success' in __jwt_config.stdout"
+      retries: 5
+      delay: 10
+
+    # --- Create Vault policies (one per SPIFFE identity) ---
+    - name: Create Vault policies for each SPIFFE identity
+      ansible.builtin.shell:
+        cmd: |
+          oc exec -n {{ vault_namespace }} {{ __vault_pod.stdout_lines[0] }} -- \
+            sh -c 'cat <<POLICY | vault policy write {{ item.value.vault_policy }} -
+          {% for path in item.value.vault_paths %}
+          path "{{ path }}" {
+            capabilities = ["read"]
+          }
+          {% endfor %}
+          POLICY'
+        executable: /bin/bash
+      loop: "{{ aap_spiffe_ids | dict2items }}"
+      changed_when: true
+
+    # --- Create JWT roles (one per SPIFFE identity) ---
+    - name: Create Vault JWT roles for each SPIFFE identity
+      ansible.builtin.command:
+        cmd: >-
+          oc exec -n {{ vault_namespace }} {{ __vault_pod.stdout_lines[0] }} --
+          vault write auth/jwt/role/{{ item.value.vault_role }}
+          role_type=jwt
+          user_claim=sub
+          bound_audiences={{ vault_jwt_audience }}
+          bound_subject={{ item.value.spiffe_id }}
+          token_ttl=3600
+          token_policies={{ item.value.vault_policy }}
+      loop: "{{ aap_spiffe_ids | dict2items }}"
+      changed_when: true
+
+    - name: Integration complete
+      ansible.builtin.debug:
+        msg: >-
+          SPIFFE JWT auth configured in Vault.
+          Created {{ aap_spiffe_ids | length }} policies and roles.
+          OIDC discovery: https://oidc-discovery-{{ spire_namespace }}.{{ cluster_domain }}
+
+# ============================================================
+# Phase 4: Deploy spiffe-vault-client in AAP namespace
+# ============================================================
+- name: "Configure AAP SPIFFE integration"
+  hosts: localhost
+  gather_facts: false
+  connection: local
+  tags: [aap]
+  environment:
+    KUBECONFIG: "{{ kubeconfig }}"
+  tasks:
+    - name: Deploy spiffe-vault-client ConfigMap
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: v1
+          kind: ConfigMap
+          metadata:
+            name: spiffe-vault-client
+            namespace: "{{ aap_namespace }}"
+          data:
+            spiffe-vault-client.py: "{{ lookup('file', 'scripts/spiffe-vault-client.py') }}"
+
+    - name: Deploy spiffe-helper config
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: v1
+          kind: ConfigMap
+          metadata:
+            name: spiffe-helper-config
+            namespace: "{{ aap_namespace }}"
+          data:
+            helper.conf: |
+              agent_address = "/run/spire/sockets/agent.sock"
+              cmd = ""
+              cert_dir = "/svids"
+              svid_file_name = "svid.pem"
+              svid_key_file_name = "svid_key.pem"
+              svid_bundle_file_name = "svid_bundle.pem"
+
+              jwt_svids = [
+                {
+                  jwt_audience = "{{ vault_jwt_audience }}"
+                  jwt_svid_file_name = "/svids/jwt.token"
+                }
+              ]
+
+    - name: Deploy credential fetcher CronJob
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: batch/v1
+          kind: CronJob
+          metadata:
+            name: spiffe-vault-credential-sync
+            namespace: "{{ aap_namespace }}"
+          spec:
+            schedule: "*/5 * * * *"
+            concurrencyPolicy: Replace
+            successfulJobsHistoryLimit: 3
+            failedJobsHistoryLimit: 3
+            jobTemplate:
+              spec:
+                template:
+                  spec:
+                    restartPolicy: OnFailure
+                    initContainers:
+                      - name: spiffe-helper
+                        image: "{{ spire_helper_image }}"
+                        args: ["-config", "/run/spire/config/helper.conf", "-exitWhenReady"]
+                        volumeMounts:
+                          - name: spire-agent-socket
+                            mountPath: /run/spire/sockets
+                            readOnly: true
+                          - name: svids
+                            mountPath: /svids
+                          - name: spiffe-helper-config
+                            mountPath: /run/spire/config
+                            readOnly: true
+                    containers:
+                      - name: vault-client
+                        image: registry.access.redhat.com/ubi9/python-311:latest
+                        command: ["python3", "/opt/app-root/src/spiffe-vault-client.py", "--init"]
+                        env:
+                          - name: VAULT_URL
+                            value: "http://vault.{{ vault_namespace }}.svc.cluster.local:8200"
+                          - name: VAULT_ROLE
+                            value: aap-platform
+                          - name: VAULT_CREDENTIAL_PATH
+                            value: secret/data/hub/aap/config
+                          - name: JWT_TOKEN_FILE
+                            value: /svids/jwt.token
+                          - name: CREDENTIALS_FILE
+                            value: /run/secrets/credentials/vault-token
+                        volumeMounts:
+                          - name: svids
+                            mountPath: /svids
+                            readOnly: true
+                          - name: credentials
+                            mountPath: /run/secrets/credentials
+                          - name: spiffe-vault-client
+                            mountPath: /opt/app-root/src
+                            readOnly: true
+                    volumes:
+                      - name: spire-agent-socket
+                        hostPath:
+                          path: /run/spire/sockets
+                          type: Directory
+                      - name: svids
+                        emptyDir: {}
+                      - name: credentials
+                        emptyDir: {}
+                      - name: spiffe-helper-config
+                        configMap:
+                          name: spiffe-helper-config
+                      - name: spiffe-vault-client
+                        configMap:
+                          name: spiffe-vault-client
+
+    - name: AAP integration complete
+      ansible.builtin.debug:
+        msg: >-
+          SPIFFE Vault client deployed in {{ aap_namespace }}.
+          CronJob runs every 5 minutes to sync credentials from Vault using SPIFFE JWT.

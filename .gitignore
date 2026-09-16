@@ -1,0 +1,25 @@
+# Secrets
+*.key
+*.pem
+*.crt
+values-secret*.yaml
+!values-secret.yaml.example
+
+# State files
+.state/
+*.state.yml
+
+# Ansible
+*.retry
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
