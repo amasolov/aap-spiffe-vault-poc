@@ -558,16 +558,19 @@
       changed_when: true
       failed_when: false
 
-    - name: Register AAP SPIFFE IDs (per agent)
-      ansible.builtin.command:
+    - name: Register AAP SPIFFE IDs (per agent, per-identity selectors)
+      ansible.builtin.shell:
         cmd: >-
           oc exec -n {{ spire_namespace }} {{ __spire_server_pod.stdout_lines[0] }} -c spire-server --
           /opt/spire/bin/spire-server entry create
           -socketPath /run/spire/data/api.sock
           -spiffeID {{ item.0.value.spiffe_id }}
           -parentID {{ item.1 }}
-          -selector k8s:ns:{{ aap_namespace }}
+          {% for sel in item.0.value.selectors %}
+          -selector {{ sel }}
+          {% endfor %}
           -dns {{ item.0.key }}.{{ aap_namespace }}.svc.cluster.local
+        executable: /bin/bash
       loop: "{{ aap_spiffe_ids | dict2items | product(__active_agents.stdout_lines) }}"
       register: __entry_create
       changed_when: "'Entry ID' in __entry_create.stdout"
@@ -1011,7 +1014,7 @@
       changed_when: true
 
     # --- Create JWT roles (one per SPIFFE identity) ---
-    - name: Create Vault JWT roles for each SPIFFE identity
+    - name: Create Vault JWT roles for each SPIFFE identity (with bound_subject)
       ansible.builtin.shell:
         cmd: >-
           oc exec -n {{ vault_namespace }} {{ __vault_pod.stdout_lines[0] }} --
@@ -1020,7 +1023,7 @@
           role_type=jwt
           user_claim=sub
           bound_audiences={{ vault_jwt_audience }}
-          bound_subject=''
+          bound_subject={{ item.value.spiffe_id }}
           token_ttl=3600
           token_policies={{ item.value.vault_policy }}
         executable: /bin/bash
@@ -1359,9 +1362,97 @@
                         configMap:
                           name: spiffe-vault-client
 
+    # --- Grant default SA privileged SCC for EE pods ---
+    - name: Grant default SA privileged SCC (for EE pod init containers)
+      ansible.builtin.command:
+        cmd: "oc adm policy add-scc-to-user privileged -z default -n {{ aap_namespace }}"
+      changed_when: true
+      failed_when: false
+
+    # --- Create per-org Container Groups in AAP ---
+    - name: Get AAP admin password
+      kubernetes.core.k8s_info:
+        api_version: v1
+        kind: Secret
+        name: aap-admin-password
+        namespace: "{{ aap_namespace }}"
+      register: __aap_admin_secret
+
+    - name: Set AAP admin credentials
+      ansible.builtin.set_fact:
+        __aap_admin_password: "{{ __aap_admin_secret.resources[0].data.password | b64decode }}"
+        __aap_api_url: "https://{{ aap_route }}/api/controller/v2"
+      when: __aap_admin_secret.resources | length > 0
+
+    - name: Create per-org Container Groups
+      ansible.builtin.uri:
+        url: "{{ __aap_api_url }}/instance_groups/"
+        method: POST
+        user: admin
+        password: "{{ __aap_admin_password }}"
+        force_basic_auth: true
+        validate_certs: false
+        body_format: json
+        status_code: [200, 201, 400]
+        body:
+          name: "spiffe-{{ item.key | replace('_', '-') }}"
+          is_container_group: true
+          pod_spec_override: |
+            apiVersion: v1
+            kind: Pod
+            metadata:
+              namespace: {{ aap_namespace }}
+              labels:
+                spiffe.io/spiffe-id: "org-{{ item.key | replace('_', '-') }}"
+            spec:
+              serviceAccountName: default
+              initContainers:
+                - name: init-spiffe-helper
+                  image: {{ spire_helper_image }}
+                  args:
+                    - "-config"
+                    - "/run/spire/config/helper.conf"
+                    - "-daemon-mode=false"
+                  securityContext:
+                    privileged: true
+                    seLinuxOptions:
+                      type: spc_t
+                  volumeMounts:
+                    - name: spire-agent-socket
+                      mountPath: /run/spire/sockets
+                    - name: svids
+                      mountPath: /svids
+                    - name: spiffe-helper-config
+                      mountPath: /run/spire/config
+                      readOnly: true
+              containers:
+                - name: worker
+                  volumeMounts:
+                    - name: svids
+                      mountPath: /svids
+                      readOnly: true
+              volumes:
+                - name: spire-agent-socket
+                  hostPath:
+                    path: /run/spire/sockets
+                    type: Directory
+                - name: svids
+                  emptyDir: {}
+                - name: spiffe-helper-config
+                  configMap:
+                    name: spiffe-helper-config
+      loop: "{{ aap_spiffe_ids | dict2items | selectattr('value.target', 'equalto', 'org') }}"
+      when: __aap_admin_password is defined
+      register: __cg_results
+      failed_when: false
+
     - name: AAP integration complete
       ansible.builtin.debug:
         msg: >-
           Kyverno ClusterPolicy deployed. AAP pods matching controller/EDA/gateway
           will automatically get spiffe-helper and spiffe-vault-client sidecars
           injected. Credentials are continuously renewed inside each pod.
+
+          Per-org Container Groups created for EE pod isolation. Each org's
+          EE pods get a SPIFFE identity scoped to that org's Vault path.
+          Use the spiffe_vault lookup plugin in playbooks to fetch secrets.

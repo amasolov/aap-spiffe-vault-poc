@@ -31,6 +31,23 @@ aap_cr_name: aap
 aap_route: "aap-aap.{{ cluster_domain }}"
 
 # SPIFFE IDs for AAP components
+#
+# Each identity has:
+#   spiffe_id:    The SPIFFE URI assigned to workloads matching the selectors
+#   vault_role:   Vault JWT auth role name
+#   vault_policy: Vault policy name (scopes read access to vault_paths)
+#   vault_paths:  Vault KV v2 paths this identity can read
+#   selectors:    SPIRE workload selectors (tightened per identity)
+#   target:       Which pods this identity is for (platform/org/eda)
+#
+# RBAC model:
+#   - Platform identity: only controller SA pods (runs sidecar for platform secrets)
+#   - Org identities: only EE pods with the matching org label (per-job isolation)
+#   - EDA identity: only EDA SA pods (event-driven credential fetch)
+#
+# The selectors ensure each pod type gets exactly one SPIFFE identity.
+# Vault's bound_subject enforces that a JWT for one identity cannot
+# authenticate to another identity's role.
 aap_spiffe_ids:
   platform:
     spiffe_id: "spiffe://{{ spire_trust_domain }}/ns/{{ aap_namespace }}/sa/aap-controller"
@@ -39,30 +56,99 @@ aap_spiffe_ids:
     vault_paths:
       - "secret/data/hub/aap/*"
       - "secret/data/global/*"
+    selectors:
+      - "k8s:ns:{{ aap_namespace }}"
+      - "k8s:sa:aap-controller"
+    target: platform
   infra_corp:
     spiffe_id: "spiffe://{{ spire_trust_domain }}/ns/{{ aap_namespace }}/org/infra-corp"
     vault_role: aap-org-infra-corp
     vault_policy: aap-org-infra-corp-secret
     vault_paths:
       - "secret/data/aap/org/infra-corp/*"
+    selectors:
+      - "k8s:ns:{{ aap_namespace }}"
+      - "k8s:pod-label:spiffe.io/spiffe-id:org-infra-corp"
+    target: org
   appdev_squad:
     spiffe_id: "spiffe://{{ spire_trust_domain }}/ns/{{ aap_namespace }}/org/appdev-squad"
     vault_role: aap-org-appdev-squad
     vault_policy: aap-org-appdev-squad-secret
     vault_paths:
       - "secret/data/aap/org/appdev-squad/*"
+    selectors:
+      - "k8s:ns:{{ aap_namespace }}"
+      - "k8s:pod-label:spiffe.io/spiffe-id:org-appdev-squad"
+    target: org
   secops_team:
     spiffe_id: "spiffe://{{ spire_trust_domain }}/ns/{{ aap_namespace }}/org/secops-team"
     vault_role: aap-org-secops-team
     vault_policy: aap-org-secops-team-secret
     vault_paths:
       - "secret/data/aap/org/secops-team/*"
+    selectors:
+      - "k8s:ns:{{ aap_namespace }}"
+      - "k8s:pod-label:spiffe.io/spiffe-id:org-secops-team"
+    target: org
   platform_ops:
     spiffe_id: "spiffe://{{ spire_trust_domain }}/ns/{{ aap_namespace }}/org/platform-ops"
     vault_role: aap-org-platform-ops
     vault_policy: aap-org-platform-ops-secret
     vault_paths:
       - "secret/data/aap/org/platform-ops/*"
+    selectors:
+      - "k8s:ns:{{ aap_namespace }}"
+      - "k8s:pod-label:spiffe.io/spiffe-id:org-platform-ops"
+    target: org
 
 # Vault JWT auth
 vault_jwt_audience: "vault.{{ cluster_domain }}"
+
+# Container Group pod spec template for org-scoped EE pods
+# Each org gets a Container Group whose pod spec includes:
+#   1. The org label (for SPIRE selector matching)
+#   2. spiffe-helper init container (fetches JWT-SVID)
+#   3. Shared svids volume (JWT available to the worker container)
+#   4. SPIRE agent socket hostPath
+ee_pod_spec_template:
+  apiVersion: v1
+  kind: Pod
+  metadata:
+    namespace: "{{ aap_namespace }}"
+  spec:
+    serviceAccountName: default
+    initContainers:
+      - name: init-spiffe-helper
+        image: "{{ spire_helper_image }}"
+        args:
+          - "-config"
+          - "/run/spire/config/helper.conf"
+          - "-daemon-mode=false"
+        securityContext:
+          privileged: true
+          seLinuxOptions:
+            type: spc_t
+        volumeMounts:
+          - name: spire-agent-socket
+            mountPath: /run/spire/sockets
+          - name: svids
+            mountPath: /svids
+          - name: spiffe-helper-config
+            mountPath: /run/spire/config
+            readOnly: true
+    containers:
+      - name: worker
+        volumeMounts:
+          - name: svids
+            mountPath: /svids
+            readOnly: true
+    volumes:
+      - name: spire-agent-socket
+        hostPath:
+          path: /run/spire/sockets
+          type: Directory
+      - name: svids
+        emptyDir: {}
+      - name: spiffe-helper-config
+        configMap:
+          name: spiffe-helper-config

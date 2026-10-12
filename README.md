@@ -181,17 +181,53 @@ ansible-playbook deploy-poc.yml --tags kyverno     # Deploy Kyverno policy engin
 ansible-playbook deploy-poc.yml --tags aap         # Kyverno policy for AAP sidecar injection
 ```
 
+## Playbook Consumption: spiffe_vault Lookup Plugin
+
+The `spiffe_vault` Ansible lookup plugin is the bridge between the SPIFFE
+infrastructure and playbook secret access. It authenticates to Vault
+per-lookup using the EE pod's SPIFFE JWT-SVID:
+
+```yaml
+# Fetch a single secret field
+db_password: "{{ lookup('spiffe_vault',
+    'secret/data/aap/org/infra-corp/creds',
+    field='db_password',
+    vault_role='aap-org-infra-corp') }}"
+```
+
+Each AAP Organization is assigned a per-org Container Group whose pod spec:
+1. Labels the EE pod for SPIRE identity selection
+2. Injects spiffe-helper as an init container to fetch the JWT-SVID
+3. Mounts the JWT on the worker container at `/svids/jwt.token`
+
+The lookup plugin reads the JWT, authenticates to Vault with the org's role,
+and returns the secret. Cross-org access fails because Vault's `bound_subject`
+rejects JWTs with the wrong SPIFFE ID.
+
+### RBAC Model (Four Layers)
+
+| Layer | Mechanism | What It Enforces |
+|---|---|---|
+| 1. SPIRE selectors | `k8s:sa:` / `k8s:pod-label:` | Each pod type gets exactly one SPIFFE ID |
+| 2. Vault bound_subject | JWT `sub` must match role | JWT for org A can't auth to org B's role |
+| 3. Kyverno + Container Groups | Per-workload sidecar/init config | Controller gets platform role, EE gets org role |
+| 4. Lookup plugin | Per-call Vault auth | No ambient credentials, no pre-fetched cache |
+
 ## Repository Structure
 
 ```
 ansible.cfg                       Ansible configuration
 inventory/hosts.yml               Inventory (localhost)
-group_vars/all.yml                Global variables (cluster domain, SPIFFE IDs, etc.)
+group_vars/all.yml                Global variables (cluster domain, SPIFFE IDs, selectors)
 deploy-poc.yml                    Full deployment playbook
 demo-scenarios.yml                Three demo scenarios
 teardown-poc.yml                  Cleanup playbook
 scripts/
   spiffe-vault-client.py          Credential manager (adapted from ZTVP qtodo pattern)
+lookup_plugins/
+  spiffe_vault.py                 Ansible lookup plugin for per-job Vault auth
+playbooks/
+  demo-credential-isolation.yml   Demo: per-org credential isolation
 ```
 
 ## Adapting for Your Cluster
