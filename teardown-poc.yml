@@ -17,6 +17,15 @@
     KUBECONFIG: "{{ kubeconfig }}"
   tasks:
     # --- Clean AAP namespace of POC resources ---
+    - name: Delete Kyverno ClusterPolicy
+      kubernetes.core.k8s:
+        state: absent
+        kind: ClusterPolicy
+        name: inject-spiffe-vault-sidecars
+        api_version: kyverno.io/v1
+      ignore_errors: true
+      tags: [kyverno, aap, always]
+
     - name: Delete SPIFFE integration resources from AAP namespace
       kubernetes.core.k8s:
         state: absent
@@ -30,6 +39,21 @@
         - { kind: ConfigMap, name: spiffe-helper-config }
       ignore_errors: true
       tags: [aap, always]
+
+    - name: Uninstall Kyverno
+      ansible.builtin.shell:
+        cmd: "helm uninstall kyverno -n {{ kyverno_namespace }} 2>/dev/null || true"
+        executable: /bin/bash
+      ignore_errors: true
+      tags: [kyverno]
+
+    - name: Delete Kyverno namespace
+      kubernetes.core.k8s:
+        state: absent
+        kind: Namespace
+        name: "{{ kyverno_namespace }}"
+      ignore_errors: true
+      tags: [kyverno]
 
     # --- Delete SPIRE ---
     - name: Delete SPIRE ClusterRoleBindings

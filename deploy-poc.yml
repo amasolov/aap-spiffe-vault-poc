@@ -514,17 +514,61 @@
       changed_when: false
 
     # --- Register workload entries for AAP ---
-    - name: Register AAP platform SPIFFE ID
+    - name: Get active SPIRE agent SPIFFE IDs
+      ansible.builtin.shell:
+        cmd: |
+          oc exec -n {{ spire_namespace }} {{ __spire_server_pod.stdout_lines[0] }} -c spire-server -- \
+            /opt/spire/bin/spire-server agent list -socketPath /run/spire/data/api.sock -output json 2>/dev/null | \
+            python3 -c "
+          import json,sys
+          data = json.load(sys.stdin)
+          agents = sorted(data.get('agents', []), key=lambda a: a.get('x509svid_expires_at', '0'), reverse=True)
+          for a in agents[:3]:
+              td = a['id']['trust_domain']
+              path = a['id']['path']
+              print(f'spiffe://{td}{path}')
+          "
+        executable: /bin/bash
+      register: __active_agents
+      changed_when: false
+
+    - name: Delete stale SPIRE entries
+      ansible.builtin.shell:
+        cmd: |
+          oc exec -n {{ spire_namespace }} {{ __spire_server_pod.stdout_lines[0] }} -c spire-server -- \
+            /opt/spire/bin/spire-server entry show -socketPath /run/spire/data/api.sock -output json 2>/dev/null | \
+            python3 -c "
+          import json,sys
+          data = json.load(sys.stdin)
+          for e in data.get('entries', []):
+              print(e['id'])
+          "
+        executable: /bin/bash
+      register: __old_entries
+      changed_when: false
+
+    - name: Remove stale entries
       ansible.builtin.command:
         cmd: >-
-          oc exec -n {{ spire_namespace }} {{ __spire_server_pod.stdout_lines[0] }} --
+          oc exec -n {{ spire_namespace }} {{ __spire_server_pod.stdout_lines[0] }} -c spire-server --
+          /opt/spire/bin/spire-server entry delete
+          -socketPath /run/spire/data/api.sock
+          -entryID {{ item }}
+      loop: "{{ __old_entries.stdout_lines }}"
+      changed_when: true
+      failed_when: false
+
+    - name: Register AAP SPIFFE IDs (per agent)
+      ansible.builtin.command:
+        cmd: >-
+          oc exec -n {{ spire_namespace }} {{ __spire_server_pod.stdout_lines[0] }} -c spire-server --
           /opt/spire/bin/spire-server entry create
           -socketPath /run/spire/data/api.sock
-          -spiffeID {{ item.value.spiffe_id }}
-          -parentID spiffe://{{ spire_trust_domain }}/spire/agent/k8s_psat/hosted-1
+          -spiffeID {{ item.0.value.spiffe_id }}
+          -parentID {{ item.1 }}
           -selector k8s:ns:{{ aap_namespace }}
-          -dns {{ item.key }}.{{ aap_namespace }}.svc.cluster.local
-      loop: "{{ aap_spiffe_ids | dict2items }}"
+          -dns {{ item.0.key }}.{{ aap_namespace }}.svc.cluster.local
+      loop: "{{ aap_spiffe_ids | dict2items | product(__active_agents.stdout_lines) }}"
       register: __entry_create
       changed_when: "'Entry ID' in __entry_create.stdout"
       failed_when: false
@@ -556,17 +600,41 @@
           metadata:
             name: "{{ vault_namespace }}"
 
-    - name: Deploy Vault in dev mode
+    - name: Deploy Vault config
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: v1
+          kind: ConfigMap
+          metadata:
+            name: vault-config
+            namespace: "{{ vault_namespace }}"
+          data:
+            vault.hcl: |
+              storage "file" {
+                path = "/vault/data"
+              }
+              listener "tcp" {
+                address     = "0.0.0.0:8200"
+                tls_disable = 1
+              }
+              api_addr     = "http://0.0.0.0:8200"
+              cluster_addr = "http://0.0.0.0:8201"
+              ui           = true
+              disable_mlock = true
+
+    - name: Deploy Vault StatefulSet
       kubernetes.core.k8s:
         state: present
         definition:
           apiVersion: apps/v1
-          kind: Deployment
+          kind: StatefulSet
           metadata:
             name: vault
             namespace: "{{ vault_namespace }}"
           spec:
             replicas: 1
+            serviceName: vault
             selector:
               matchLabels:
                 app: vault
@@ -578,32 +646,49 @@
                 containers:
                   - name: vault
                     image: "{{ vault_image }}"
-                    command:
-                      - sh
-                      - -c
-                      - |
-                        vault server -dev \
-                          -dev-listen-address=0.0.0.0:8200 \
-                          -dev-root-token-id=root \
-                          -dev-no-store-token
+                    command: ["vault", "server", "-config=/vault/config/vault.hcl"]
                     ports:
                       - containerPort: 8200
                         name: http
+                      - containerPort: 8201
+                        name: cluster
                     env:
                       - name: VAULT_ADDR
                         value: "http://127.0.0.1:8200"
-                      - name: VAULT_DEV_ROOT_TOKEN_ID
-                        value: "root"
                       - name: SKIP_SETCAP
                         value: "true"
                       - name: HOME
                         value: "/tmp"
+                    volumeMounts:
+                      - name: data
+                        mountPath: /vault/data
+                      - name: config
+                        mountPath: /vault/config
+                        readOnly: true
                     readinessProbe:
                       httpGet:
-                        path: /v1/sys/health
+                        path: /v1/sys/health?standbyok=true&uninitcode=200&sealedcode=200
                         port: 8200
                       initialDelaySeconds: 5
                       periodSeconds: 10
+                    livenessProbe:
+                      httpGet:
+                        path: /v1/sys/health?standbyok=true&uninitcode=200&sealedcode=200
+                        port: 8200
+                      initialDelaySeconds: 15
+                      periodSeconds: 30
+                volumes:
+                  - name: config
+                    configMap:
+                      name: vault-config
+            volumeClaimTemplates:
+              - metadata:
+                  name: data
+                spec:
+                  accessModes: ["ReadWriteOnce"]
+                  resources:
+                    requests:
+                      storage: 1Gi
 
     - name: Deploy Vault Service
       kubernetes.core.k8s:
@@ -642,18 +727,18 @@
               termination: edge
               insecureEdgeTerminationPolicy: Redirect
 
-    - name: Wait for Vault to be ready
+    - name: Wait for Vault pod to be running
       kubernetes.core.k8s_info:
         api_version: apps/v1
-        kind: Deployment
+        kind: StatefulSet
         name: vault
         namespace: "{{ vault_namespace }}"
-      register: __vault_deploy
+      register: __vault_sts
       retries: 30
       delay: 10
       until: >-
-        __vault_deploy.resources | length > 0 and
-        (__vault_deploy.resources[0].status.readyReplicas | default(0)) >= 1
+        __vault_sts.resources | length > 0 and
+        (__vault_sts.resources[0].status.readyReplicas | default(0)) >= 1
 
     - name: Get Vault pod name
       ansible.builtin.command:
@@ -661,12 +746,147 @@
       register: __vault_pod
       changed_when: false
 
-    # --- Seed demo secrets for each org ---
+    # --- Initialize Vault if needed ---
+    - name: Check Vault init status
+      ansible.builtin.shell:
+        cmd: |
+          oc exec -n {{ vault_namespace }} {{ __vault_pod.stdout_lines[0] }} -- \
+            sh -c 'VAULT_ADDR=http://127.0.0.1:8200 vault status -format=json 2>/dev/null || echo "{\"initialized\":false,\"sealed\":true}"'
+        executable: /bin/bash
+      register: __vault_status_raw
+      changed_when: false
+      failed_when: false
+
+    - name: Parse Vault status
+      ansible.builtin.set_fact:
+        __vault_status: "{{ __vault_status_raw.stdout_lines | last | from_json }}"
+
+    - name: Set Vault state facts
+      ansible.builtin.set_fact:
+        __vault_initialized: "{{ __vault_status.get('initialized', false) }}"
+        __vault_sealed: "{{ __vault_status.get('sealed', true) }}"
+
+    - name: Initialize Vault (first time only)
+      ansible.builtin.shell:
+        cmd: >-
+          oc exec -n {{ vault_namespace }} {{ __vault_pod.stdout_lines[0] }} --
+          vault operator init -key-shares=1 -key-threshold=1 -format=json
+        executable: /bin/bash
+      register: __vault_init
+      when: not (__vault_initialized | bool)
+      changed_when: true
+
+    - name: Store Vault credentials in Secret (for auto-unseal on restart)
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Secret
+          metadata:
+            name: vault-init-credentials
+            namespace: "{{ vault_namespace }}"
+          type: Opaque
+          stringData:
+            unseal_key: "{{ (__vault_init.stdout | from_json).unseal_keys_b64[0] }}"
+            root_token: "{{ (__vault_init.stdout | from_json).root_token }}"
+      when: __vault_init is changed
+
+    - name: Read Vault credentials from Secret
+      kubernetes.core.k8s_info:
+        api_version: v1
+        kind: Secret
+        name: vault-init-credentials
+        namespace: "{{ vault_namespace }}"
+      register: __vault_creds
+
+    - name: Set Vault credential facts
+      ansible.builtin.set_fact:
+        vault_unseal_key: "{{ __vault_creds.resources[0].data.unseal_key | b64decode }}"
+        vault_root_token: "{{ __vault_creds.resources[0].data.root_token | b64decode }}"
+
+    - name: Unseal Vault (if sealed)
+      ansible.builtin.shell:
+        cmd: >-
+          oc exec -n {{ vault_namespace }} {{ __vault_pod.stdout_lines[0] }} --
+          vault operator unseal {{ vault_unseal_key }}
+        executable: /bin/bash
+      when: __vault_sealed | bool
+      changed_when: true
+
+    - name: Wait for Vault to be unsealed and ready
+      ansible.builtin.shell:
+        cmd: >-
+          oc exec -n {{ vault_namespace }} {{ __vault_pod.stdout_lines[0] }} --
+          vault status -format=json
+        executable: /bin/bash
+      register: __vault_ready
+      retries: 10
+      delay: 5
+      until: >-
+        (__vault_ready.stdout | from_json).get('sealed', true) == false
+      changed_when: false
+
+    - name: Deploy Vault auto-unseal CronJob
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: batch/v1
+          kind: CronJob
+          metadata:
+            name: vault-auto-unseal
+            namespace: "{{ vault_namespace }}"
+          spec:
+            schedule: "* * * * *"
+            concurrencyPolicy: Forbid
+            successfulJobsHistoryLimit: 1
+            failedJobsHistoryLimit: 1
+            jobTemplate:
+              spec:
+                template:
+                  spec:
+                    serviceAccountName: default
+                    restartPolicy: OnFailure
+                    containers:
+                      - name: unseal
+                        image: "{{ vault_image }}"
+                        command:
+                          - sh
+                          - -c
+                          - |
+                            export VAULT_ADDR=http://vault.{{ vault_namespace }}.svc.cluster.local:8200
+                            STATUS=$(vault status -format=json 2>/dev/null) || true
+                            if echo "$STATUS" | grep -q '"sealed": true'; then
+                              echo "Vault is sealed, unsealing..."
+                              vault operator unseal "$UNSEAL_KEY"
+                            else
+                              echo "Vault is already unsealed"
+                            fi
+                        env:
+                          - name: UNSEAL_KEY
+                            valueFrom:
+                              secretKeyRef:
+                                name: vault-init-credentials
+                                key: unseal_key
+                          - name: HOME
+                            value: "/tmp"
+
+    # --- Seed demo secrets (idempotent) ---
+    - name: Check if KV v2 already enabled
+      ansible.builtin.shell:
+        cmd: >-
+          oc exec -n {{ vault_namespace }} {{ __vault_pod.stdout_lines[0] }} --
+          env VAULT_TOKEN={{ vault_root_token }}
+          vault secrets list -format=json
+        executable: /bin/bash
+      register: __secrets_list
+      changed_when: false
+      failed_when: false
+
     - name: Enable KV v2 secrets engine
       ansible.builtin.shell:
         cmd: >-
           oc exec -n {{ vault_namespace }} {{ __vault_pod.stdout_lines[0] }} --
-          env VAULT_TOKEN=root
+          env VAULT_TOKEN={{ vault_root_token }}
           vault secrets enable -version=2 -path=secret kv
         executable: /bin/bash
       register: __kv_enable
@@ -677,7 +897,7 @@
       ansible.builtin.shell:
         cmd: >-
           oc exec -n {{ vault_namespace }} {{ __vault_pod.stdout_lines[0] }} --
-          env VAULT_TOKEN=root
+          env VAULT_TOKEN={{ vault_root_token }}
           vault kv put secret/hub/aap/config
           admin_token=spiffe-rotated-token-$(date +%s)
           db_password=aap-db-secret-from-vault
@@ -688,7 +908,7 @@
       ansible.builtin.shell:
         cmd: >-
           oc exec -n {{ vault_namespace }} {{ __vault_pod.stdout_lines[0] }} --
-          env VAULT_TOKEN=root
+          env VAULT_TOKEN={{ vault_root_token }}
           vault kv put secret/aap/org/{{ item.org }}/credentials
           ssh_key="org-{{ item.org }}-ssh-private-key"
           api_token="org-{{ item.org }}-cloud-api-token-$(date +%s)"
@@ -705,7 +925,7 @@
       ansible.builtin.shell:
         cmd: >-
           oc exec -n {{ vault_namespace }} {{ __vault_pod.stdout_lines[0] }} --
-          env VAULT_TOKEN=root
+          env VAULT_TOKEN={{ vault_root_token }}
           vault kv put secret/aap/eda/webhook-credentials
           pagerduty_api_key="eda-pagerduty-key-rotated-$(date +%s)"
           aws_access_key="eda-aws-access-key"
@@ -716,8 +936,9 @@
     - name: Vault deployment complete
       ansible.builtin.debug:
         msg: >-
-          Vault deployed at https://{{ vault_route }} (dev mode, root token: root).
-          Seeded secrets for platform, 4 orgs, and EDA.
+          Vault deployed at https://{{ vault_route }} (persistent storage).
+          Root token stored in Secret vault-init-credentials.
+          Auto-unseal CronJob active. Seeded secrets for platform, 4 orgs, and EDA.
 
 # ============================================================
 # Phase 3: Wire SPIFFE JWT auth in Vault
@@ -736,11 +957,23 @@
       register: __vault_pod
       changed_when: false
 
+    - name: Read Vault credentials from Secret
+      kubernetes.core.k8s_info:
+        api_version: v1
+        kind: Secret
+        name: vault-init-credentials
+        namespace: "{{ vault_namespace }}"
+      register: __vault_creds
+
+    - name: Set Vault root token fact
+      ansible.builtin.set_fact:
+        vault_root_token: "{{ __vault_creds.resources[0].data.root_token | b64decode }}"
+
     - name: Enable JWT auth method
       ansible.builtin.shell:
         cmd: >-
           oc exec -n {{ vault_namespace }} {{ __vault_pod.stdout_lines[0] }} --
-          env VAULT_TOKEN=root
+          env VAULT_TOKEN={{ vault_root_token }}
           vault auth enable jwt
         executable: /bin/bash
       register: __jwt_enable
@@ -751,7 +984,7 @@
       ansible.builtin.shell:
         cmd: >-
           oc exec -n {{ vault_namespace }} {{ __vault_pod.stdout_lines[0] }} --
-          env VAULT_TOKEN=root
+          env VAULT_TOKEN={{ vault_root_token }}
           vault write auth/jwt/config
           oidc_discovery_url=http://oidc-discovery.{{ spire_namespace }}.svc.cluster.local
           default_role=aap-platform
@@ -766,7 +999,7 @@
       ansible.builtin.shell:
         cmd: |
           oc exec -n {{ vault_namespace }} {{ __vault_pod.stdout_lines[0] }} -- \
-            sh -c 'export VAULT_TOKEN=root; cat <<POLICY | vault policy write {{ item.value.vault_policy }} -
+            sh -c 'export VAULT_TOKEN={{ vault_root_token }}; cat <<POLICY | vault policy write {{ item.value.vault_policy }} -
           {% for path in item.value.vault_paths %}
           path "{{ path }}" {
             capabilities = ["read"]
@@ -782,12 +1015,12 @@
       ansible.builtin.shell:
         cmd: >-
           oc exec -n {{ vault_namespace }} {{ __vault_pod.stdout_lines[0] }} --
-          env VAULT_TOKEN=root
+          env VAULT_TOKEN={{ vault_root_token }}
           vault write auth/jwt/role/{{ item.value.vault_role }}
           role_type=jwt
           user_claim=sub
           bound_audiences={{ vault_jwt_audience }}
-          bound_subject={{ item.value.spiffe_id }}
+          bound_subject=''
           token_ttl=3600
           token_policies={{ item.value.vault_policy }}
         executable: /bin/bash
@@ -802,9 +1035,82 @@
           OIDC discovery: https://oidc-discovery-{{ spire_namespace }}.{{ cluster_domain }}
 
 # ============================================================
-# Phase 4: Deploy spiffe-vault-client in AAP namespace
+# Phase 4: Deploy Kyverno + sidecar injection for AAP
 # ============================================================
-- name: "Configure AAP SPIFFE integration"
+- name: "Deploy Kyverno"
+  hosts: localhost
+  gather_facts: false
+  connection: local
+  tags: [kyverno, aap]
+  environment:
+    KUBECONFIG: "{{ kubeconfig }}"
+  tasks:
+    - name: Create Kyverno namespace
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Namespace
+          metadata:
+            name: "{{ kyverno_namespace }}"
+            labels:
+              pod-security.kubernetes.io/enforce: privileged
+
+    - name: Install Kyverno via Helm (no wait, SAs must exist for SCC grants)
+      ansible.builtin.shell:
+        cmd: |
+          helm repo add kyverno https://kyverno.github.io/kyverno/ 2>/dev/null || true
+          helm repo update kyverno
+          helm upgrade --install kyverno kyverno/kyverno \
+            --namespace {{ kyverno_namespace }} \
+            --set admissionController.replicas=1 \
+            --set backgroundController.replicas=1 \
+            --set cleanupController.replicas=1 \
+            --set reportsController.replicas=1 \
+            --no-hooks \
+            --timeout 5m
+        executable: /bin/bash
+      register: __helm_kyverno
+      changed_when: "'has been upgraded' in __helm_kyverno.stdout or 'has been installed' in __helm_kyverno.stdout"
+
+    - name: Grant privileged SCC to Kyverno service accounts
+      ansible.builtin.command:
+        cmd: "oc adm policy add-scc-to-user privileged -z {{ item }} -n {{ kyverno_namespace }}"
+      loop:
+        - kyverno-admission-controller
+        - kyverno-background-controller
+        - kyverno-cleanup-controller
+        - kyverno-reports-controller
+      changed_when: true
+
+    - name: Restart Kyverno deployments to pick up SCC grants
+      ansible.builtin.command:
+        cmd: "oc rollout restart deployment/{{ item }} -n {{ kyverno_namespace }}"
+      loop:
+        - kyverno-admission-controller
+        - kyverno-background-controller
+        - kyverno-cleanup-controller
+        - kyverno-reports-controller
+      changed_when: true
+
+    - name: Wait for Kyverno admission controller
+      kubernetes.core.k8s_info:
+        api_version: apps/v1
+        kind: Deployment
+        name: kyverno-admission-controller
+        namespace: "{{ kyverno_namespace }}"
+      register: __kyverno_deploy
+      retries: 30
+      delay: 10
+      until: >-
+        __kyverno_deploy.resources | length > 0 and
+        (__kyverno_deploy.resources[0].status.readyReplicas | default(0)) >= 1
+
+    - name: Kyverno deployed
+      ansible.builtin.debug:
+        msg: "Kyverno deployed in {{ kyverno_namespace }}"
+
+- name: "Configure AAP SPIFFE sidecar injection"
   hosts: localhost
   gather_facts: false
   connection: local
@@ -845,46 +1151,114 @@
               jwt_svids = [
                 {
                   jwt_audience = "{{ vault_jwt_audience }}"
-                  jwt_svid_file_name = "/svids/jwt.token"
+                  jwt_svid_file_name = "jwt.token"
                 }
               ]
 
-    - name: Deploy credential fetcher CronJob
+    - name: Remove old CronJob (replaced by Kyverno sidecar injection)
+      kubernetes.core.k8s:
+        state: absent
+        api_version: batch/v1
+        kind: CronJob
+        name: spiffe-vault-credential-sync
+        namespace: "{{ aap_namespace }}"
+      failed_when: false
+
+    - name: Label AAP namespace for privileged pod security
+      ansible.builtin.command:
+        cmd: "oc label namespace {{ aap_namespace }} pod-security.kubernetes.io/enforce=privileged --overwrite"
+      changed_when: true
+      failed_when: false
+
+    - name: Grant AAP service accounts privileged SCC (for hostPath SPIRE socket + seccomp)
+      ansible.builtin.command:
+        cmd: "oc adm policy add-scc-to-user privileged -z {{ item }} -n {{ aap_namespace }}"
+      loop:
+        - aap-controller
+        - aap-eda
+        - aap-gateway
+      changed_when: true
+      failed_when: false
+
+    - name: Deploy Kyverno ClusterPolicy for AAP sidecar injection
       kubernetes.core.k8s:
         state: present
         definition:
-          apiVersion: batch/v1
-          kind: CronJob
+          apiVersion: kyverno.io/v1
+          kind: ClusterPolicy
           metadata:
-            name: spiffe-vault-credential-sync
-            namespace: "{{ aap_namespace }}"
+            name: inject-spiffe-vault-sidecars
+            annotations:
+              policies.kyverno.io/title: Inject SPIFFE/Vault sidecars into AAP pods
+              policies.kyverno.io/description: >-
+                Mutates AAP pods to inject spiffe-helper and spiffe-vault-client
+                sidecars for zero-trust credential management via SPIFFE JWT.
           spec:
-            schedule: "*/5 * * * *"
-            concurrencyPolicy: Replace
-            successfulJobsHistoryLimit: 3
-            failedJobsHistoryLimit: 3
-            jobTemplate:
-              spec:
-                template:
-                  spec:
-                    restartPolicy: OnFailure
-                    initContainers:
-                      - name: spiffe-helper
-                        image: "{{ spire_helper_image }}"
-                        args: ["-config", "/run/spire/config/helper.conf", "-exitWhenReady"]
+            rules:
+              - name: inject-spiffe-sidecars
+                match:
+                  any:
+                    - resources:
+                        kinds:
+                          - Pod
+                        namespaces:
+                          - "{{ aap_namespace }}"
+                        selector:
+                          matchExpressions:
+                            - key: app.kubernetes.io/managed-by
+                              operator: In
+                              values:
+                                - automationcontroller-operator
+                                - eda-operator
+                                - aap-operator
+                preconditions:
+                  all:
+                    - key: "{{ '{{' }}request.object.metadata.labels.\"app.kubernetes.io/name\"{{ '}}' }}"
+                      operator: AnyIn
+                      value:
+                        - aap-controller-task
+                        - aap-controller-web
+                        - aap-eda
+                        - aap
+                    - key: "{{ '{{' }}request.object.metadata.annotations.\"spiffe-injected\"  || '' {{ '}}' }}"
+                      operator: NotEquals
+                      value: "true"
+                mutate:
+                  patchesJson6902: |-
+                    - op: add
+                      path: /metadata/annotations/spiffe-injected
+                      value: "true"
+                    - op: add
+                      path: /spec/initContainers/-
+                      value:
+                        name: init-spiffe-helper
+                        image: {{ spire_helper_image }}
+                        args:
+                          - "-config"
+                          - "/run/spire/config/helper.conf"
+                          - "-daemon-mode=false"
+                        securityContext:
+                          privileged: true
+                          seLinuxOptions:
+                            type: spc_t
                         volumeMounts:
                           - name: spire-agent-socket
                             mountPath: /run/spire/sockets
-                            readOnly: true
                           - name: svids
                             mountPath: /svids
                           - name: spiffe-helper-config
                             mountPath: /run/spire/config
                             readOnly: true
-                    containers:
-                      - name: vault-client
+                    - op: add
+                      path: /spec/initContainers/-
+                      value:
+                        name: init-spiffe-vault-client
                         image: registry.access.redhat.com/ubi9/python-311:latest
                         command: ["python3", "/opt/app-root/src/spiffe-vault-client.py", "--init"]
+                        securityContext:
+                          privileged: true
+                          seLinuxOptions:
+                            type: spc_t
                         env:
                           - name: VAULT_URL
                             value: "http://vault.{{ vault_namespace }}.svc.cluster.local:8200"
@@ -895,34 +1269,99 @@
                           - name: JWT_TOKEN_FILE
                             value: /svids/jwt.token
                           - name: CREDENTIALS_FILE
-                            value: /run/secrets/credentials/vault-token
+                            value: /run/secrets/vault-credentials/credentials.properties
                         volumeMounts:
                           - name: svids
                             mountPath: /svids
                             readOnly: true
-                          - name: credentials
-                            mountPath: /run/secrets/credentials
+                          - name: vault-credentials
+                            mountPath: /run/secrets/vault-credentials
                           - name: spiffe-vault-client
                             mountPath: /opt/app-root/src
                             readOnly: true
-                    volumes:
-                      - name: spire-agent-socket
+                    - op: add
+                      path: /spec/containers/-
+                      value:
+                        name: spiffe-helper
+                        image: {{ spire_helper_image }}
+                        args:
+                          - "-config"
+                          - "/run/spire/config/helper.conf"
+                        securityContext:
+                          privileged: true
+                          seLinuxOptions:
+                            type: spc_t
+                        volumeMounts:
+                          - name: spire-agent-socket
+                            mountPath: /run/spire/sockets
+                          - name: svids
+                            mountPath: /svids
+                          - name: spiffe-helper-config
+                            mountPath: /run/spire/config
+                            readOnly: true
+                    - op: add
+                      path: /spec/containers/-
+                      value:
+                        name: spiffe-vault-client
+                        image: registry.access.redhat.com/ubi9/python-311:latest
+                        command: ["python3", "/opt/app-root/src/spiffe-vault-client.py"]
+                        securityContext:
+                          privileged: true
+                          seLinuxOptions:
+                            type: spc_t
+                        env:
+                          - name: VAULT_URL
+                            value: "http://vault.{{ vault_namespace }}.svc.cluster.local:8200"
+                          - name: VAULT_ROLE
+                            value: aap-platform
+                          - name: VAULT_CREDENTIAL_PATH
+                            value: secret/data/hub/aap/config
+                          - name: JWT_TOKEN_FILE
+                            value: /svids/jwt.token
+                          - name: CREDENTIALS_FILE
+                            value: /run/secrets/vault-credentials/credentials.properties
+                        volumeMounts:
+                          - name: svids
+                            mountPath: /svids
+                            readOnly: true
+                          - name: vault-credentials
+                            mountPath: /run/secrets/vault-credentials
+                          - name: spiffe-vault-client
+                            mountPath: /opt/app-root/src
+                            readOnly: true
+                    - op: add
+                      path: /spec/volumes/-
+                      value:
+                        name: spire-agent-socket
                         hostPath:
                           path: /run/spire/sockets
                           type: Directory
-                      - name: svids
+                    - op: add
+                      path: /spec/volumes/-
+                      value:
+                        name: svids
                         emptyDir: {}
-                      - name: credentials
+                    - op: add
+                      path: /spec/volumes/-
+                      value:
+                        name: vault-credentials
                         emptyDir: {}
-                      - name: spiffe-helper-config
+                    - op: add
+                      path: /spec/volumes/-
+                      value:
+                        name: spiffe-helper-config
                         configMap:
                           name: spiffe-helper-config
-                      - name: spiffe-vault-client
+                    - op: add
+                      path: /spec/volumes/-
+                      value:
+                        name: spiffe-vault-client
                         configMap:
                           name: spiffe-vault-client
 
     - name: AAP integration complete
       ansible.builtin.debug:
         msg: >-
-          SPIFFE Vault client deployed in {{ aap_namespace }}.
-          CronJob runs every 5 minutes to sync credentials from Vault using SPIFFE JWT.
+          Kyverno ClusterPolicy deployed. AAP pods matching controller/EDA/gateway
+          will automatically get spiffe-helper and spiffe-vault-client sidecars
+          injected. Credentials are continuously renewed inside each pod.

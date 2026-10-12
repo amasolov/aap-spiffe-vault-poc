@@ -20,7 +20,10 @@ vault_namespace: vault
 vault_version: "1.17.2"
 vault_image: "docker.io/hashicorp/vault:{{ vault_version }}"
 vault_route: "vault.{{ cluster_domain }}"
-vault_internal_url: "https://vault.{{ vault_namespace }}.svc.cluster.local:8200"
+vault_internal_url: "http://vault.{{ vault_namespace }}.svc.cluster.local:8200"
+
+# Kyverno
+kyverno_namespace: kyverno
 
 # AAP
 aap_namespace: aap

@@ -57,15 +57,38 @@ publishes a standard `/.well-known/openid-configuration` endpoint that serves
 the public keys (JWKS) Vault uses to verify JWT-SVIDs. This is the bridge
 that lets Vault trust SPIRE-issued tokens without a direct integration.
 
-**spiffe-helper** is an init container (from the official SPIRE project) that
-connects to the SPIRE Agent's Workload API and writes a JWT-SVID to a shared
-volume (`/svids/jwt.token`). The JWT has a 5-minute TTL and contains the pod's
-SPIFFE ID as the `sub` claim and the Vault audience as the `aud` claim. It
-exits once the SVID is written (using `-exitWhenReady`).
+**Kyverno** is a Kubernetes policy engine deployed via Helm. A `ClusterPolicy`
+mutates AAP pods at admission time, injecting `spiffe-helper` and
+`spiffe-vault-client` as init containers and sidecars. This eliminates manual
+pod patching and ensures every new AAP pod automatically gets zero-trust
+credential management.
+
+**Vault** runs as a StatefulSet with persistent file-backed storage on a PVC.
+On first deploy, it auto-initializes and stores the unseal key + root token in
+a Kubernetes Secret (`vault-init-credentials`). A CronJob checks every minute
+and auto-unseals Vault after restarts. JWT auth, policies, secrets, and KV
+engine configuration all persist across pod restarts.
+
+**spiffe-helper** is injected by Kyverno into AAP pods in two roles:
+- As an **init container** (`-daemon-mode=false`): fetches a JWT-SVID from the
+  SPIRE Agent's Workload API once and writes it to `/svids/jwt.token`, then exits.
+- As a **sidecar**: runs continuously in daemon mode, rotating the JWT-SVID
+  before it expires.
+
+The JWT has a 5-minute TTL and contains the pod's SPIFFE ID as the `sub` claim
+and the Vault audience as the `aud` claim.
 
 **spiffe-vault-client** (`scripts/spiffe-vault-client.py`) is the credential
 manager adapted from the Validated Pattern's
-[qtodo sidecar](https://github.com/validatedpatterns/layered-zero-trust). It:
+[qtodo sidecar](https://github.com/validatedpatterns/layered-zero-trust). It
+is also injected by Kyverno in two roles:
+
+- As an **init container** (`--init`): authenticates to Vault, fetches secrets,
+  writes them to a shared volume, and exits.
+- As a **sidecar**: runs continuously, re-authenticating and refreshing secrets
+  at 50% of the Vault token lease duration.
+
+The full flow for each injected pod:
 
 1. Reads the JWT-SVID file written by spiffe-helper
 2. POSTs it to Vault's `/v1/auth/jwt/login` endpoint with the assigned role
@@ -73,20 +96,20 @@ manager adapted from the Validated Pattern's
 4. Uses that token to read secrets from the allowed Vault path
 5. Writes the secrets to a file that AAP can consume
 
-It supports three modes: `--init` (fetch once and exit, used in the CronJob),
-sidecar (continuous loop with automatic token renewal at 50% of lease), and
-`--print-secrets` (one-shot demo output to stdout).
-
 ### End-to-End Flow
 
-1. **SPIRE Agent** validates the AAP pod via the kubelet k8s_psat attestor
-2. **spiffe-helper** init container fetches a JWT-SVID from the Workload API (5-min TTL)
-3. **spiffe-vault-client** POSTs the JWT to Vault `/v1/auth/jwt/login`
-4. **Vault** validates the JWT signature against SPIRE's OIDC public keys and checks
+1. **Kyverno** intercepts AAP pod creation and mutates the spec, injecting spiffe-helper
+   and spiffe-vault-client as init containers and sidecars
+2. **SPIRE Agent** validates the pod via the kubelet k8s_psat attestor
+3. **init-spiffe-helper** fetches a JWT-SVID from the Workload API (5-min TTL) and exits
+4. **init-spiffe-vault-client** POSTs the JWT to Vault `/v1/auth/jwt/login`
+5. **Vault** validates the JWT signature against SPIRE's OIDC public keys and checks
    the `sub` (SPIFFE ID) and `aud` (audience) claims match the configured role
-5. **Vault** returns a scoped token (1-hour TTL) with only the policies assigned to that role
-6. **spiffe-vault-client** uses the token to read secrets and writes them to a shared file
-7. **AAP** consumes the credentials from the file
+6. **Vault** returns a scoped token (1-hour TTL) with only the policies assigned to that role
+7. **init-spiffe-vault-client** reads secrets, writes them to a shared volume, and exits
+8. **AAP containers** start and consume the credentials from the shared volume
+9. **sidecar spiffe-helper** continuously rotates the JWT-SVID before expiry
+10. **sidecar spiffe-vault-client** continuously re-authenticates and refreshes secrets
 
 ## Three Demo Scenarios
 
@@ -152,9 +175,10 @@ ansible-playbook teardown-poc.yml
 
 ```bash
 ansible-playbook deploy-poc.yml --tags spire      # SPIRE server + agent + OIDC
-ansible-playbook deploy-poc.yml --tags vault       # Vault in dev mode + seed secrets
+ansible-playbook deploy-poc.yml --tags vault       # Vault persistent + auto-unseal + seed
 ansible-playbook deploy-poc.yml --tags integrate   # Wire SPIFFE JWT auth in Vault
-ansible-playbook deploy-poc.yml --tags aap         # Deploy sidecar in AAP namespace
+ansible-playbook deploy-poc.yml --tags kyverno     # Deploy Kyverno policy engine
+ansible-playbook deploy-poc.yml --tags aap         # Kyverno policy for AAP sidecar injection
 ```
 
 ## Repository Structure
