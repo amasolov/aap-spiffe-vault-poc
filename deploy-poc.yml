@@ -446,6 +446,13 @@
                       - "/run/spire/sockets"
                       - "-csi-socket-path"
                       - "/spiffe-csi/csi.sock"
+                      - "-node-id"
+                      - "$(MY_NODE_NAME)"
+                    env:
+                      - name: MY_NODE_NAME
+                        valueFrom:
+                          fieldRef:
+                            fieldPath: spec.nodeName
                     securityContext:
                       privileged: true
                     volumeMounts:
@@ -499,6 +506,7 @@
             attachRequired: false
             podInfoOnMount: true
             fsGroupPolicy: None
+            seLinuxMount: true
             volumeLifecycleModes:
               - Ephemeral
 
@@ -1331,6 +1339,9 @@
                           - "-config"
                           - "/run/spire/config/helper.conf"
                           - "-daemon-mode=false"
+                        securityContext:
+                          seLinuxOptions:
+                            type: spc_t
                         volumeMounts:
                           - name: spiffe-workload-api
                             mountPath: /run/spire/sockets
@@ -1374,6 +1385,9 @@
                         args:
                           - "-config"
                           - "/run/spire/config/helper.conf"
+                        securityContext:
+                          seLinuxOptions:
+                            type: spc_t
                         volumeMounts:
                           - name: spiffe-workload-api
                             mountPath: /run/spire/sockets
@@ -1490,6 +1504,9 @@
                     - "-config"
                     - "/run/spire/config/helper.conf"
                     - "-daemon-mode=false"
+                  securityContext:
+                    seLinuxOptions:
+                      type: spc_t
                   volumeMounts:
                     - name: spiffe-workload-api
                       mountPath: /run/spire/sockets

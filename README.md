@@ -73,10 +73,16 @@ volumes:
 ```
 
 Benefits over hostPath:
-- No privileged security context needed on workload containers
 - No `fix-jwt-perms` init container (CSI handles permissions)
 - Standard Kubernetes volume interface
-- Compatible with Pod Security Standards (restricted profile)
+- Cleaner security model (only CSI driver DaemonSet needs privileged)
+
+**OpenShift SELinux note:** On SELinux-enforcing clusters, containers that
+connect to the SPIRE agent socket need `seLinuxOptions.type: spc_t` because
+the agent socket inherits the `container_var_run_t` SELinux label from the
+host. The CSIDriver has `seLinuxMount: true` for Kubernetes-level support.
+In production, consider using SPIRE's Delegated Identity API or relabeling
+the socket to `container_file_t` to avoid requiring `spc_t` on workloads.
 
 ### End-to-End Flow
 
