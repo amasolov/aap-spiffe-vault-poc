@@ -1,68 +1,124 @@
-# AAP + SPIFFE/Vault Zero-Trust POC
+# Zero-Trust Secret Access for AAP with SPIFFE and Vault
 
-Granular, per-workload secret access for Ansible Automation Platform using
-[SPIFFE](https://spiffe.io/) cryptographic workload identity and HashiCorp Vault.
+A proposed pattern for granular, per-workload secret access in Ansible
+Automation Platform using [SPIFFE](https://spiffe.io/) cryptographic
+workload identity and HashiCorp Vault.
 
-## Why SPIFFE for AAP?
+## Table of Contents
 
-AAP 2.7 supports several Vault auth methods natively: AppRole, scoped tokens,
-Kubernetes auth, and the new OIDC workload identity credential. These work
-well when a platform admin configures credentials per job template.
+- [The Problem](#the-problem)
+- [Architecture](#architecture)
+- [Open Questions for AAP Product](#open-questions-for-aap-product)
+- [Deployment Guide](#deployment-guide)
+- [Demo Scenarios](#demo-scenarios)
+- [References](#references)
 
-Enterprise customers with multi-tenant AAP environments need more:
+---
 
-| Need | Native AAP | This POC (SPIFFE) |
-|---|---|---|
-| Per-org secret isolation | Manual credential per JT | Automatic via pod labels |
-| Cross-cluster trust | Separate config per cluster | SPIRE federation |
-| Workload attestation | Bearer token (asserted) | Kubelet attestation (verified) |
-| Self-service for teams | Admin configures each JT | Org label triggers identity |
-| Playbook-level scoping | Vault bound_claims (requires per-JT OIDC credential) | CredentialComposer + SPIRE selectors |
+## The Problem
 
-SPIFFE adds infrastructure-level workload identity that complements AAP's
-application-level OIDC JWT. Different AAP organizations get different SPIFFE
-identities, different Vault policies, and different secret access, with
-zero manual credential configuration per job template.
+### Multi-Tenant AAP Needs Per-Workload Secret Scoping
+
+Enterprise customers run multi-tenant AAP environments where different
+organizations, projects, and job templates must access different secrets.
+A single AAP instance serves multiple teams, each with their own cloud
+credentials, SSH keys, and API tokens stored in HashiCorp Vault.
+
+Today, AAP provides several Vault auth methods (AppRole, scoped tokens,
+Kubernetes auth, OIDC workload identity). All of them require manual
+credential configuration per job template. None of them provide
+**infrastructure-level workload attestation**: the ability for an external
+system to verify which AAP organization, project, or playbook is running
+inside a given container, and to scope secret access based on that
+verified identity.
+
+### What's Missing
+
+| Capability | Status in AAP 2.7 |
+|---|---|
+| Per-org Vault secret isolation | Requires manual credential per JT |
+| Cryptographic workload identity | OIDC JWT exists but must be configured per JT |
+| Infrastructure-level attestation | No pod/container labels for org/project/playbook |
+| Cross-cluster trust federation | Separate config per cluster |
+| Self-service secret access | Platform admin must configure each JT |
+
+### Two Complementary Gaps
+
+1. **Labels for external attestation**: AWX does not label K8s pods or
+   podman containers with org/project/playbook metadata. SPIRE, Istio,
+   OPA, and other infrastructure tools cannot differentiate AAP workloads.
+
+2. **Activation for built-in OIDC JWT**: AAP 2.7's OIDC JWT already
+   contains the full org hierarchy (`organization_name`, `project_name`,
+   `playbook_name`, hierarchical `groups` claim). But it is only minted
+   when a "HashiCorp Vault Secret Lookup (OIDC)" credential is explicitly
+   attached to each job template. There is no credential inheritance or
+   default OIDC credential per organization.
+
+Both gaps are detailed in [Open Questions](#open-questions-for-aap-product)
+below.
+
+---
 
 ## Architecture
 
+This pattern uses SPIFFE/SPIRE to provide infrastructure-level workload
+identity for AAP pods, and Vault JWT auth to exchange that identity for
+scoped secret access. The approach complements (not replaces) AAP's
+built-in OIDC JWT.
+
+### How It Works
+
 ```
-                    SPIRE Server
-                   (trust root, CA)
-                    /         \
-            SPIRE Agent     OIDC Discovery Provider
-           (workload API)   (serves JWKS for Vault)
-                |                 |
-          SPIFFE CSI Driver  Vault JWT Auth
-         (mounts Workload    (validates JWT via
-          API into pods)      OIDC Discovery)
-                |                 |
-          spiffe-helper      Vault Token
-         (fetch JWT-SVID)    (scoped to org policy)
-                |                 |
-              AAP EE Pod ---------+
-         (lookup plugin fetches secrets per call)
+┌─────────────────────────────────────────────────────────────────┐
+│                        SPIRE Server                             │
+│               (trust root, issues SVIDs, CA)                    │
+│                    /              \                              │
+│           SPIRE Agent      OIDC Discovery Provider              │
+│          (Workload API)    (serves JWKS for Vault)              │
+│               │                      │                          │
+│        SPIFFE CSI Driver       Vault JWT Auth                   │
+│       (mounts Workload API     (validates JWT against           │
+│        into pods via CSI)       OIDC Discovery)                 │
+│               │                      │                          │
+│         spiffe-helper          Vault scoped token               │
+│        (fetches JWT-SVID)      (per-org policy)                 │
+│               │                      │                          │
+│            AAP EE Pod ───────────────┘                          │
+│       (lookup plugin fetches secrets per call)                  │
+└─────────────────────────────────────────────────────────────────┘
 ```
+
+### End-to-End Flow
+
+1. **Kyverno** intercepts AAP pod creation, injects sidecars + SPIFFE CSI volume
+2. **SPIFFE CSI Driver** mounts the SPIRE Workload API socket into the pod
+3. **SPIRE Agent** validates the pod via kubelet `k8s_psat` attestation
+4. **init-spiffe-helper** fetches a JWT-SVID (5-min TTL) and writes to `/svids/jwt.token`
+5. **init-spiffe-vault-client** POSTs the JWT to Vault `/v1/auth/jwt/login`
+6. **Vault** validates the JWT signature via SPIRE's OIDC public keys, checks `sub` and `aud` claims
+7. **Vault** returns a scoped token with only the policies for that SPIFFE identity
+8. **init-spiffe-vault-client** reads secrets, writes to shared volume, exits
+9. **AAP containers** start and consume credentials from the shared volume
+10. **Sidecars** continuously rotate JWT-SVID and refresh secrets
 
 ### Components
 
-| Component | What It Does | Deployed As |
+| Component | Role | Deployed As |
 |---|---|---|
-| SPIRE Server | Trust root, issues SVIDs, serves as CA | StatefulSet in `spire-system` |
-| SPIRE Agent | Attests workloads via kubelet, exposes Workload API | DaemonSet on every node |
-| SPIFFE CSI Driver | Mounts the Workload API socket into pods as a CSI volume | DaemonSet on every node |
-| OIDC Discovery Provider | Publishes JWKS so Vault can verify JWT-SVIDs | Sidecar in SPIRE Server pod |
-| Kyverno | Injects spiffe-helper + vault-client sidecars into AAP pods | Deployment in `kyverno` |
-| Vault | Stores secrets, validates JWTs via OIDC Discovery | StatefulSet in `vault` |
-| spiffe-helper | Fetches JWT-SVID from Workload API, writes to file | Injected init container + sidecar |
-| spiffe-vault-client | Exchanges JWT for Vault token, fetches secrets | Injected init container + sidecar |
+| **SPIRE Server** | Trust root, issues SVIDs, serves as CA | StatefulSet in `spire-system` |
+| **SPIRE Agent** | Attests workloads via kubelet, exposes Workload API | DaemonSet (every node) |
+| **SPIFFE CSI Driver** | Mounts the Workload API socket into pods | DaemonSet (every node) |
+| **OIDC Discovery** | Publishes JWKS so Vault can verify JWT-SVIDs | Sidecar in SPIRE Server |
+| **Vault** | Stores secrets, validates JWTs via OIDC Discovery | StatefulSet in `vault` |
+| **Kyverno** | Injects spiffe-helper + vault-client sidecars | Deployment in `kyverno` |
+| **spiffe-helper** | Fetches JWT-SVID from Workload API | Injected init + sidecar |
+| **spiffe-vault-client** | Exchanges JWT for Vault token, fetches secrets | Injected init + sidecar |
 
 ### SPIFFE CSI Driver
 
-The SPIFFE CSI driver replaces hostPath mounts for the SPIRE Agent socket.
-Instead of mounting `/run/spire/sockets` from the host (which requires
-privileged containers), each pod gets the Workload API socket via a CSI
-ephemeral volume:
+The SPIFFE CSI driver replaces `hostPath` mounts for the SPIRE agent socket.
+Each pod gets the Workload API via a CSI ephemeral volume:
 
 ```yaml
 volumes:
@@ -72,67 +128,44 @@ volumes:
       readOnly: true
 ```
 
-Benefits over hostPath:
-- No `fix-jwt-perms` init container (CSI handles permissions)
-- Standard Kubernetes volume interface
-- Cleaner security model (only CSI driver DaemonSet needs privileged)
+This eliminates the need for `hostPath` volumes on workload pods and removes
+the `fix-jwt-perms` init container that was previously required.
 
-**OpenShift SELinux note:** On SELinux-enforcing clusters, containers that
-connect to the SPIRE agent socket need `seLinuxOptions.type: spc_t` because
-the agent socket inherits the `container_var_run_t` SELinux label from the
-host. The CSIDriver has `seLinuxMount: true` for Kubernetes-level support.
+**OpenShift SELinux note:** On SELinux-enforcing clusters (all OCP), containers
+that connect to the SPIRE agent socket need `seLinuxOptions.type: spc_t` because
+the agent socket inherits the `container_var_run_t` label from the host. The
+CSIDriver resource has `seLinuxMount: true` for Kubernetes-level SELinux support.
 In production, consider using SPIRE's Delegated Identity API or relabeling
-the socket to `container_file_t` to avoid requiring `spc_t` on workloads.
+the socket to `container_file_t` to avoid `spc_t` on workloads.
 
-### End-to-End Flow
+### RBAC Model (Four Layers)
 
-1. **Kyverno** intercepts AAP pod creation and injects sidecars + CSI volume
-2. **SPIFFE CSI Driver** mounts the Workload API socket into the pod
-3. **SPIRE Agent** validates the pod via kubelet k8s_psat attestation
-4. **init-spiffe-helper** fetches a JWT-SVID (5-min TTL) and writes to `/svids/jwt.token`
-5. **init-spiffe-vault-client** POSTs the JWT to Vault `/v1/auth/jwt/login`
-6. **Vault** validates the JWT signature via SPIRE's OIDC public keys, checks `sub` and `aud`
-7. **Vault** returns a scoped token with only the policies for that SPIFFE identity
-8. **init-spiffe-vault-client** reads secrets, writes to shared volume, exits
-9. **AAP containers** start and consume credentials from the shared volume
-10. **Sidecars** continuously rotate JWT-SVID and refresh secrets
+| Layer | Mechanism | Enforcement |
+|---|---|---|
+| 1. SPIRE selectors | `k8s:sa:` / `k8s:pod-label:` | Each pod type gets exactly one SPIFFE ID |
+| 2. Vault bound_subject | JWT `sub` must match role | JWT for org A cannot auth to org B's role |
+| 3. Kyverno + Container Groups | Per-workload sidecar config | Controller gets platform role, EE gets org role |
+| 4. Lookup plugin | Per-call Vault auth | No ambient credentials, no pre-fetched cache |
 
-## Demo Scenarios
-
-### Scenario 1: Platform Zero-Trust Identity
-
-AAP's platform identity (`spiffe://...ns/aap/sa/aap-controller`) authenticates
-to Vault and reads platform-level secrets at `hub/aap/*`.
-
-### Scenario 2: Multi-Org Secret Isolation
+### Multi-Org Secret Isolation
 
 Each AAP organization gets its own SPIFFE ID and Vault policy:
 
 | Organization | SPIFFE ID | Vault Path |
 |---|---|---|
-| Infra-Corp | `spiffe://...org/infra-corp` | `secret/data/aap/org/infra-corp/*` |
-| AppDev-Squad | `spiffe://...org/appdev-squad` | `secret/data/aap/org/appdev-squad/*` |
-| SecOps-Team | `spiffe://...org/secops-team` | `secret/data/aap/org/secops-team/*` |
-| Platform-Ops | `spiffe://...org/platform-ops` | `secret/data/aap/org/platform-ops/*` |
+| Infra-Corp | `spiffe://.../org/infra-corp` | `secret/data/aap/org/infra-corp/*` |
+| AppDev-Squad | `spiffe://.../org/appdev-squad` | `secret/data/aap/org/appdev-squad/*` |
+| SecOps-Team | `spiffe://.../org/secops-team` | `secret/data/aap/org/secops-team/*` |
+| Platform-Ops | `spiffe://.../org/platform-ops` | `secret/data/aap/org/platform-ops/*` |
 
 Infra-Corp **cannot** read AppDev-Squad's secrets, even though they share the
-same AAP instance. Verified via E2E tests on a live cluster.
+same AAP instance. Verified via E2E tests: Vault returns HTTP 403 for cross-org
+access attempts.
 
-### Scenario 3: EDA Dynamic Credentials
+### Playbook Consumption
 
-An EDA rulebook activation gets AWS credentials from Vault at event time,
-authenticated by the EDA pod's SPIFFE identity. Credentials are never persisted.
-
-## RBAC Model (Four Layers)
-
-| Layer | Mechanism | What It Enforces |
-|---|---|---|
-| 1. SPIRE selectors | `k8s:sa:` / `k8s:pod-label:` | Each pod type gets exactly one SPIFFE ID |
-| 2. Vault bound_subject | JWT `sub` must match role | JWT for org A can't auth to org B's role |
-| 3. Kyverno + Container Groups | Per-workload sidecar/init config | Controller gets platform role, EE gets org role |
-| 4. Lookup plugin | Per-call Vault auth | No ambient credentials, no pre-fetched cache |
-
-## Playbook Consumption: spiffe_vault Lookup Plugin
+The `spiffe_vault` lookup plugin authenticates to Vault per call using the
+pod's JWT-SVID:
 
 ```yaml
 db_password: "{{ lookup('spiffe_vault',
@@ -145,51 +178,87 @@ Each org's Container Group labels the EE pod for SPIRE identity selection.
 The lookup plugin reads the JWT, authenticates to Vault with the org's role,
 and returns the secret. Cross-org access is denied by Vault's `bound_subject`.
 
-## Open Questions: AWX Gaps for Granular Attestation
+---
+
+## Open Questions for AAP Product
 
 Source code analysis of AWX (verified against the production-installed code
-on the lab cluster) identified gaps that prevent fully granular workload
-attestation at the org/project/playbook level.
+on a live cluster) identified three gaps that prevent fully granular workload
+attestation at the org/project/job template/playbook level.
 
 ### Gap 1: No org/project/playbook labels on K8s EE pods
 
-AWX `receptor.py` (line 772-776) sets only two labels on execution pods:
-`ansible-awx` (install UUID) and `ansible-awx-job-id`. No organization,
-project, job template, or playbook labels are injected. SPIRE (and any
-external identity system) cannot differentiate jobs by scope.
+**Source:** `awx/main/tasks/receptor.py` lines 772-776
 
-The data is available at pod creation time (`self.task.instance.organization`,
-`project`, `playbook`). Adding labels would be ~10 lines.
+AWX sets only two labels on execution environment pods: `ansible-awx`
+(install UUID) and `ansible-awx-job-id`. No organization, project, job
+template, or playbook labels are injected. SPIRE (and any external identity
+system) cannot differentiate jobs by scope.
+
+**Impact:** The SPIFFE identity for EE pods can only be scoped to the
+organization level (via Container Group labels set at org level). It cannot
+be scoped to project or playbook level because that data never appears on
+the pod.
+
+**Fix:** The data is available at pod creation time
+(`self.task.instance.organization`, `.project`, `.playbook`). Adding labels
+would be approximately 10 lines of code.
 
 ### Gap 2: No container labels on podman execution (VM nodes)
 
-`build_execution_environment_params()` in `jobs.py` passes no `--label` flags
-to podman. There is no `container_options_override` field on `InstanceGroup`
-(unlike `pod_spec_override` for K8s).
+**Source:** `awx/main/tasks/jobs.py` lines 360-413
+
+`build_execution_environment_params()` passes no `--label` flags to podman.
+There is no `container_options_override` field on `InstanceGroup` (unlike
+`pod_spec_override` for K8s). On-premise execution nodes running podman
+have no mechanism for external identity systems to identify the running job.
+
+**Impact:** SPIRE, systemd, or any container-aware attestation system on
+VM execution nodes cannot differentiate AAP jobs.
 
 ### Gap 3: OIDC JWT requires per-JT credential configuration
 
-AAP 2.7's OIDC JWT already contains the full org hierarchy as claims
-(`organization_name`, `project_name`, `playbook_name`, hierarchical `groups`).
+**Source:** `awx/main/tasks/jobs.py` lines 286-330
+
+AAP 2.7's OIDC workload identity JWT already contains the full org
+hierarchy as claims:
+- `aap_controller_organization_name`
+- `aap_controller_project_name`
+- `aap_controller_playbook_name`
+- `aap_groups` (hierarchical: `org:X/project:Y/jt:Z/playbook:P`)
+
 But the JWT is only minted when a "HashiCorp Vault Secret Lookup (OIDC)"
-credential is explicitly attached to each job template. There is no mechanism
-for credential inheritance from org/project level or a default OIDC credential
-per organization.
+credential is explicitly attached to each job template. There is no
+mechanism for credential inheritance from org or project level, and no
+default OIDC credential per organization.
 
-### Complementary, Not Alternative
+**Impact:** To use the rich claims that are already built into the JWT,
+an admin must manually attach the OIDC credential to every job template.
+This does not scale for large multi-tenant environments.
 
-Pod/container labels benefit SPIRE and external attestation systems.
-The OIDC JWT benefits Vault directly. Both are needed: labels for
-infrastructure-level attestation, JWT for application-level authorization.
+### Labels and JWT Are Complementary
 
-## Prerequisites
+| Mechanism | Audience | Strength |
+|---|---|---|
+| Pod/container labels | SPIRE, Istio, OPA, infrastructure tools | Enables infrastructure-level attestation |
+| OIDC JWT claims | Vault, cloud IAM, application-level auth | Cryptographically signed, contains full org hierarchy |
 
-- OCP 4.x cluster with AAP 2.7 deployed
+Both are needed: labels for external attestation systems that operate at
+the infrastructure layer; JWT for direct Vault authorization. This POC
+uses labels + SPIRE as a bridge until the JWT activation gap is resolved.
+
+---
+
+## Deployment Guide
+
+### Prerequisites
+
+- OCP 4.14+ cluster with AAP 2.7 deployed
 - `oc` CLI authenticated to the cluster
 - `ansible-playbook` with `kubernetes.core` collection
 - `helm` CLI available
 
-## Quick Start
+### Quick Start
 
 ```bash
 git clone https://github.com/amasolov/aap-spiffe-vault-poc.git
@@ -209,7 +278,7 @@ ansible-playbook demo-scenarios.yml --tags scenario3
 ansible-playbook teardown-poc.yml
 ```
 
-### Deploy individual phases
+### Deploy Individual Phases
 
 ```bash
 ansible-playbook deploy-poc.yml --tags spire      # SPIRE + CSI driver + OIDC
@@ -219,24 +288,7 @@ ansible-playbook deploy-poc.yml --tags kyverno     # Kyverno policy engine
 ansible-playbook deploy-poc.yml --tags aap         # Kyverno policy + Container Groups
 ```
 
-## Repository Structure
-
-```
-ansible.cfg                       Ansible configuration
-inventory/hosts.yml               Inventory (localhost)
-group_vars/all.yml                Global variables (cluster domain, SPIFFE IDs, selectors)
-deploy-poc.yml                    Full deployment playbook
-demo-scenarios.yml                Three demo scenarios
-teardown-poc.yml                  Cleanup playbook
-scripts/
-  spiffe-vault-client.py          Credential manager (adapted from ZTVP qtodo pattern)
-lookup_plugins/
-  spiffe_vault.py                 Ansible lookup plugin for per-job Vault auth
-playbooks/
-  demo-credential-isolation.yml   Demo: per-org credential isolation
-```
-
-## Adapting for Your Cluster
+### Adapting for Your Cluster
 
 Edit `group_vars/all.yml`:
 
@@ -245,13 +297,82 @@ cluster_domain: "apps.your-cluster.example.com"
 aap_namespace: aap
 ```
 
-## Key References
+### Repository Structure
+
+```
+ansible.cfg                       Ansible configuration
+inventory/hosts.yml               Inventory (localhost)
+group_vars/all.yml                Global variables (cluster, SPIFFE IDs, selectors)
+deploy-poc.yml                    Full deployment playbook (4 phases)
+demo-scenarios.yml                Three demo scenarios
+teardown-poc.yml                  Cleanup playbook
+scripts/
+  spiffe-vault-client.py          Credential manager sidecar
+lookup_plugins/
+  spiffe_vault.py                 Ansible lookup plugin for per-job Vault auth
+playbooks/
+  demo-credential-isolation.yml   Demo: per-org credential isolation
+```
+
+### What Gets Deployed
+
+The playbook deploys the following (all in dedicated namespaces, AAP is
+not modified except for adding Container Groups):
+
+| Phase | Tag | What It Creates |
+|---|---|---|
+| 1. SPIRE | `spire` | SPIRE server, agents, CSI driver, OIDC provider, workload entries |
+| 2. Vault | `vault` | Vault server, auto-unseal CronJob, demo secrets (4 orgs + EDA) |
+| 3. Integration | `integrate` | JWT auth method in Vault, per-identity roles and policies |
+| 4. AAP Config | `aap` | Kyverno sidecar injection policy, per-org Container Groups |
+
+### Production Considerations
+
+This POC uses upstream SPIRE containers. For production on OpenShift,
+consider the following path:
+
+| POC | Production |
+|---|---|
+| Upstream SPIRE containers | Zero Trust Workload Identity Manager (ZTWIM, Red Hat supported) |
+| Vault file backend + manual unseal | HA Raft backend + cloud KMS auto-unseal |
+| SPIFFE CSI driver DaemonSet | ZTWIM operator-managed CSI driver |
+| Manual entry registration | ClusterSPIFFEID CRD (auto-registers via ZTWIM) |
+| Kyverno sidecar injection | ZTWIM operator or Kyverno |
+| Per-agent entry registration | ZTWIM handles agent lifecycle automatically |
+
+---
+
+## Demo Scenarios
+
+### Scenario 1: Platform Zero-Trust Identity
+
+AAP's platform identity (`spiffe://.../sa/aap-controller`) authenticates
+to Vault and reads platform-level secrets at `hub/aap/*`. The static
+credential is replaced with a short-lived, auto-rotating SPIFFE JWT that
+is cryptographically attested by the kubelet.
+
+### Scenario 2: Multi-Org Secret Isolation
+
+Each of 4 AAP organizations gets its own SPIFFE ID and Vault policy.
+Infra-Corp can read its own secrets; attempting to read AppDev-Squad's
+secrets returns HTTP 403. No shared tokens between organizations.
+
+### Scenario 3: EDA Dynamic Credentials
+
+An EDA rulebook activation gets AWS credentials from Vault at event time,
+authenticated by the EDA pod's SPIFFE identity. Credentials are never
+persisted in AAP. Every access has a cryptographic audit trail.
+
+---
+
+## References
 
 - [SPIRE SPIFFE CSI Driver](https://github.com/spiffe/spiffe-csi)
-- [layered-zero-trust pattern](https://github.com/validatedpatterns/layered-zero-trust)
-- [SPIRE + Vault OIDC tutorial](https://spiffe.io/docs/latest/keyless/vault/readme/)
-- [Vault SPIFFE auth method](https://developer.hashicorp.com/vault/docs/auth/spiffe/spiffe)
-- [AAP OIDC for Vault](https://docs.redhat.com/en/documentation/red_hat_ansible_automation_platform/2.7/whats_new-oidc_authentication_for_hashicorp_vault)
+- [Validated Patterns: Layered Zero Trust](https://github.com/validatedpatterns/layered-zero-trust)
+- [SPIRE + Vault OIDC Tutorial](https://spiffe.io/docs/latest/keyless/vault/readme/)
+- [Vault JWT/OIDC Auth Method](https://developer.hashicorp.com/vault/docs/auth/jwt)
+- [AAP 2.7: OIDC for HashiCorp Vault](https://docs.redhat.com/en/documentation/red_hat_ansible_automation_platform/2.7/whats_new-oidc_authentication_for_hashicorp_vault)
+- [Zero Trust Workload Identity Manager (ZTWIM)](https://docs.openshift.com/container-platform/latest/security/zero-trust-workload-identity.html)
 
 ## License
 

@@ -111,7 +111,7 @@ vault_jwt_audience: "vault.{{ cluster_domain }}"
 #   1. The org label (for SPIRE selector matching)
 #   2. spiffe-helper init container (fetches JWT-SVID)
 #   3. Shared svids volume (JWT available to the worker container)
-#   4. SPIRE agent socket hostPath
+#   4. SPIFFE CSI volume (replaces hostPath)
 ee_pod_spec_template:
   apiVersion: v1
   kind: Pod

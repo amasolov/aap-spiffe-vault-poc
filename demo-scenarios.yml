@@ -2,7 +2,7 @@
 # AAP SPIFFE/Vault POC - Demo Scenarios
 #
 # Three progressive demonstrations:
-#   1. Platform zero-trust: SPIFFE identity replaces root Vault token
+#   1. Platform zero-trust: SPIFFE identity replaces static credentials
 #   2. Multi-org isolation: org-scoped secrets via SPIFFE + Vault policies
 #   3. EDA dynamic credentials: event-driven secret retrieval
 #
@@ -344,7 +344,7 @@ except HTTPError as e:
           
           Three scenarios demonstrated:
           
-          1. Platform Identity: Root Vault token replaced with
+          1. Platform Identity: Static credentials replaced with
              SPIFFE JWT. Least-privilege, auto-rotating.
           
           2. Multi-Org Isolation: Each AAP org has its own
