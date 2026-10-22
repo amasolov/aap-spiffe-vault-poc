@@ -1,8 +1,10 @@
 # Zero-Trust Secret Access for AAP with SPIFFE and Vault
 
-A proposed pattern for granular, per-workload secret access in Ansible
-Automation Platform using [SPIFFE](https://spiffe.io/) cryptographic
-workload identity and HashiCorp Vault.
+A proposed pattern for granular secret access in Ansible Automation
+Platform, scoped to the full organization tree
+(`organization / project / job template / playbook`), using
+[SPIFFE](https://spiffe.io/) cryptographic workload identity and
+HashiCorp Vault.
 
 ## Table of Contents
 
@@ -17,41 +19,69 @@ workload identity and HashiCorp Vault.
 
 ## The Problem
 
-### Multi-Tenant AAP Needs Per-Workload Secret Scoping
+### Granular Secret Access Across the Full Org Tree
 
-Enterprise customers run multi-tenant AAP environments where different
-organizations, projects, and job templates must access different secrets.
-A single AAP instance serves multiple teams, each with their own cloud
-credentials, SSH keys, and API tokens stored in HashiCorp Vault.
+Enterprise customers run multi-tenant AAP environments where secrets must
+be scoped not just to an organization, but to the full hierarchy:
 
-Today, AAP provides several Vault auth methods (AppRole, scoped tokens,
-Kubernetes auth, OIDC workload identity). All of them require manual
-credential configuration per job template. None of them provide
-**infrastructure-level workload attestation**: the ability for an external
-system to verify which AAP organization, project, or playbook is running
-inside a given container, and to scope secret access based on that
-verified identity.
+```
+organization / project / job template / playbook
+```
 
-### What's Missing
+For example, a Vault policy should be able to say: "only the `deploy-prod`
+playbook in the `cloud-infra` project of the `Platform-Ops` organization
+can read the production AWS credentials." Today, AAP can only provide this
+if an admin manually configures a credential on every single job template.
 
-| Capability | Status in AAP 2.7 |
-|---|---|
-| Per-org Vault secret isolation | Requires manual credential per JT |
-| Cryptographic workload identity | OIDC JWT exists but must be configured per JT |
-| Infrastructure-level attestation | No pod/container labels for org/project/playbook |
-| Cross-cluster trust federation | Separate config per cluster |
-| Self-service secret access | Platform admin must configure each JT |
+The goal of this pattern is **automatic, granular secret scoping** where
+Vault can verify the full org tree of any running AAP job and grant access
+accordingly, with no per-JT credential configuration.
+
+### Target: Full Org Tree in Vault
+
+The desired Vault path and policy structure maps directly to the AAP
+org tree:
+
+```
+secret/data/aap/
+  org/infra-corp/                              # org-wide secrets
+    credentials                                # accessible by any job in this org
+    project/network-automation/                # project-scoped
+      credentials                              # only jobs in this project
+      jt/configure-switches/                   # JT-scoped
+        credentials                            # only this job template
+        playbook/site.yml/                     # playbook-scoped
+          credentials                          # only when running site.yml
+```
+
+To enforce this, the identity system (SPIRE or OIDC JWT) must know which
+org, project, job template, and playbook is running inside each container.
+Today, this information is not exposed on the container.
+
+### What's Missing in AAP 2.7
+
+| Capability | Status | What's Needed |
+|---|---|---|
+| Org-level secret scoping | Possible (manual credential per JT) | Automatic via workload identity |
+| Project-level scoping | Not possible | Pod labels or JWT with project claim |
+| JT-level scoping | Not possible without per-JT OIDC credential | Automatic JWT minting or pod labels |
+| Playbook-level scoping | Not possible | Pod labels with playbook name |
+| Infrastructure attestation | No pod/container labels at any level | Labels on K8s pods and podman containers |
+| Cross-cluster trust | Separate config per cluster | SPIRE federation |
 
 ### Two Complementary Gaps
 
 1. **Labels for external attestation**: AWX does not label K8s pods or
-   podman containers with org/project/playbook metadata. SPIRE, Istio,
-   OPA, and other infrastructure tools cannot differentiate AAP workloads.
+   podman containers with org/project/JT/playbook metadata. SPIRE, Istio,
+   OPA, and other infrastructure tools cannot differentiate AAP workloads
+   at any level of the org tree.
 
 2. **Activation for built-in OIDC JWT**: AAP 2.7's OIDC JWT already
    contains the full org hierarchy (`organization_name`, `project_name`,
-   `playbook_name`, hierarchical `groups` claim). But it is only minted
-   when a "HashiCorp Vault Secret Lookup (OIDC)" credential is explicitly
+   `job_template_name`, `playbook_name`, hierarchical `groups` claim with
+   `org:X/project:Y/jt:Z/playbook:P`). The claims for full-tree scoping
+   already exist in the code. But the JWT is only minted when a
+   "HashiCorp Vault Secret Lookup (OIDC)" credential is explicitly
    attached to each job template. There is no credential inheritance or
    default OIDC credential per organization.
 
@@ -64,8 +94,17 @@ below.
 
 This pattern uses SPIFFE/SPIRE to provide infrastructure-level workload
 identity for AAP pods, and Vault JWT auth to exchange that identity for
-scoped secret access. The approach complements (not replaces) AAP's
-built-in OIDC JWT.
+scoped secret access.
+
+**Current POC scope:** Demonstrates org-level isolation (4 orgs, each with
+separate SPIFFE IDs, Vault roles, and secret paths). This is the deepest
+level achievable today without changes to AWX, because AWX does not expose
+project/JT/playbook information on the pod.
+
+**Target with AWX changes:** If AWX adds pod labels for the full org tree
+(see [Open Questions](#open-questions-for-aap-product)), SPIRE selectors
+and Vault policies can scope secrets to any level:
+`org → project → job template → playbook`.
 
 ### How It Works
 
@@ -82,7 +121,7 @@ built-in OIDC JWT.
 │        into pods via CSI)       OIDC Discovery)                 │
 │               │                      │                          │
 │         spiffe-helper          Vault scoped token               │
-│        (fetches JWT-SVID)      (per-org policy)                 │
+│        (fetches JWT-SVID)      (per org/project/JT policy)      │
 │               │                      │                          │
 │            AAP EE Pod ───────────────┘                          │
 │       (lookup plugin fetches secrets per call)                  │
@@ -147,9 +186,9 @@ the socket to `container_file_t` to avoid `spc_t` on workloads.
 | 3. Kyverno + Container Groups | Per-workload sidecar config | Controller gets platform role, EE gets org role |
 | 4. Lookup plugin | Per-call Vault auth | No ambient credentials, no pre-fetched cache |
 
-### Multi-Org Secret Isolation
+### Secret Isolation: Current (Org-Level) and Target (Full Tree)
 
-Each AAP organization gets its own SPIFFE ID and Vault policy:
+**What the POC demonstrates today** (org-level, no AWX changes needed):
 
 | Organization | SPIFFE ID | Vault Path |
 |---|---|---|
@@ -162,47 +201,94 @@ Infra-Corp **cannot** read AppDev-Squad's secrets, even though they share the
 same AAP instance. Verified via E2E tests: Vault returns HTTP 403 for cross-org
 access attempts.
 
+**What becomes possible with AWX pod labels** (full org tree):
+
+If AWX labels EE pods with org/project/JT/playbook (see Gap 1), SPIRE
+selectors can assign fine-grained SPIFFE IDs:
+
+| Scope | SPIFFE ID | Vault Path | SPIRE Selector |
+|---|---|---|---|
+| Org | `spiffe://.../org/infra-corp` | `secret/data/aap/org/infra-corp/*` | `k8s:pod-label:aap-org:infra-corp` |
+| Project | `spiffe://.../org/infra-corp/proj/cloud-infra` | `.../infra-corp/project/cloud-infra/*` | `+ k8s:pod-label:aap-project:cloud-infra` |
+| JT | `spiffe://.../org/infra-corp/proj/cloud-infra/jt/deploy-prod` | `.../cloud-infra/jt/deploy-prod/*` | `+ k8s:pod-label:aap-jt:deploy-prod` |
+| Playbook | `spiffe://.../org/infra-corp/.../playbook/site.yml` | `.../deploy-prod/playbook/site.yml/*` | `+ k8s:pod-label:aap-playbook:site.yml` |
+
+This is the same pattern at every level; only the number of SPIRE selectors
+and the depth of the Vault path change. No architecture changes are needed,
+only the missing pod labels from AWX.
+
 ### Playbook Consumption
 
 The `spiffe_vault` lookup plugin authenticates to Vault per call using the
-pod's JWT-SVID:
+pod's JWT-SVID. The Vault role determines the secret scope:
 
 ```yaml
+# Org-level secret (works today)
 db_password: "{{ lookup('spiffe_vault',
     'secret/data/aap/org/infra-corp/credentials',
     field='cloud_password',
     vault_role='aap-org-infra-corp') }}"
+
+# Project-level secret (requires AWX pod labels, Gap 1)
+deploy_key: "{{ lookup('spiffe_vault',
+    'secret/data/aap/org/infra-corp/project/cloud-infra/credentials',
+    field='deploy_key',
+    vault_role='aap-org-infra-corp-proj-cloud-infra') }}"
+
+# Playbook-level secret (requires AWX pod labels, Gap 1)
+prod_aws_key: "{{ lookup('spiffe_vault',
+    'secret/data/aap/org/infra-corp/project/cloud-infra/jt/deploy-prod/playbook/site.yml/credentials',
+    field='aws_secret_key',
+    vault_role='aap-infra-corp-cloud-infra-deploy-prod-site') }}"
 ```
 
-Each org's Container Group labels the EE pod for SPIRE identity selection.
-The lookup plugin reads the JWT, authenticates to Vault with the org's role,
-and returns the secret. Cross-org access is denied by Vault's `bound_subject`.
+Each level of scoping uses the same lookup plugin and the same
+SPIRE-to-Vault flow. The only difference is the granularity of the
+SPIFFE ID (determined by pod labels) and the Vault role/policy (configured
+to match that SPIFFE ID).
 
 ---
 
 ## Open Questions for AAP Product
 
-Source code analysis of AWX (verified against the production-installed code
-on a live cluster) identified three gaps that prevent fully granular workload
-attestation at the org/project/job template/playbook level.
+Source code analysis of AWX (verified against production-installed code on
+a live cluster) identified three gaps that prevent granular secret scoping
+below the organization level.
 
-### Gap 1: No org/project/playbook labels on K8s EE pods
+**Why these gaps matter:** The architecture described above works at every
+level of the org tree (org, project, JT, playbook) with no changes. The
+only missing piece is the identity data on the container itself. Without
+it, SPIRE cannot assign a SPIFFE ID more specific than "this pod belongs
+to org X," and Vault cannot enforce policies more specific than "org X
+can read org X's secrets."
+
+### Gap 1: No org/project/JT/playbook labels on K8s EE pods
 
 **Source:** `awx/main/tasks/receptor.py` lines 772-776
 
 AWX sets only two labels on execution environment pods: `ansible-awx`
 (install UUID) and `ansible-awx-job-id`. No organization, project, job
-template, or playbook labels are injected. SPIRE (and any external identity
-system) cannot differentiate jobs by scope.
+template, or playbook labels are injected.
 
-**Impact:** The SPIFFE identity for EE pods can only be scoped to the
-organization level (via Container Group labels set at org level). It cannot
-be scoped to project or playbook level because that data never appears on
-the pod.
+**What's needed:** Four additional labels on every EE pod:
 
-**Fix:** The data is available at pod creation time
-(`self.task.instance.organization`, `.project`, `.playbook`). Adding labels
-would be approximately 10 lines of code.
+```yaml
+labels:
+  aap.ansible.com/organization: "infra-corp"
+  aap.ansible.com/project: "cloud-infra"
+  aap.ansible.com/job-template: "deploy-prod"
+  aap.ansible.com/playbook: "site.yml"
+```
+
+**Impact on this pattern:** Without these labels, SPIRE selectors can only
+match at the org level (via Container Group labels). With them, SPIRE
+selectors can match at any depth, and Vault policies can scope secrets to
+`org/project/JT/playbook`.
+
+**Fix complexity:** The data is available at pod creation time
+(`self.task.instance.organization`, `.project`, `.unified_job_template`,
+`.playbook`). Adding labels would be approximately 10 lines of code in
+`receptor.py`.
 
 ### Gap 2: No container labels on podman execution (VM nodes)
 
@@ -210,42 +296,71 @@ would be approximately 10 lines of code.
 
 `build_execution_environment_params()` passes no `--label` flags to podman.
 There is no `container_options_override` field on `InstanceGroup` (unlike
-`pod_spec_override` for K8s). On-premise execution nodes running podman
-have no mechanism for external identity systems to identify the running job.
+`pod_spec_override` for K8s).
 
-**Impact:** SPIRE, systemd, or any container-aware attestation system on
-VM execution nodes cannot differentiate AAP jobs.
+**What's needed:** The same four labels, passed as `--label` flags to
+podman. And a `container_options_override` field on `InstanceGroup` for
+operator customization.
+
+**Impact on this pattern:** On-premise execution nodes running podman have
+no mechanism for any identity system to identify the running job's org tree.
+SPIRE on VM nodes (using the `docker` or `unix` workload attestor) cannot
+differentiate AAP jobs at all.
 
 ### Gap 3: OIDC JWT requires per-JT credential configuration
 
 **Source:** `awx/main/tasks/jobs.py` lines 286-330
 
-AAP 2.7's OIDC workload identity JWT already contains the full org
-hierarchy as claims:
-- `aap_controller_organization_name`
-- `aap_controller_project_name`
-- `aap_controller_playbook_name`
-- `aap_groups` (hierarchical: `org:X/project:Y/jt:Z/playbook:P`)
+AAP 2.7's OIDC workload identity JWT already contains the full org tree
+as claims:
 
-But the JWT is only minted when a "HashiCorp Vault Secret Lookup (OIDC)"
-credential is explicitly attached to each job template. There is no
-mechanism for credential inheritance from org or project level, and no
+```json
+{
+  "aap_controller_organization_name": "Infra-Corp",
+  "aap_controller_project_name": "cloud-infra",
+  "aap_controller_job_template_name": "deploy-prod",
+  "aap_controller_playbook_name": "site.yml",
+  "aap_groups": [
+    "org:Infra-Corp",
+    "org:Infra-Corp/project:cloud-infra",
+    "org:Infra-Corp/project:cloud-infra/jt:deploy-prod",
+    "org:Infra-Corp/project:cloud-infra/jt:deploy-prod/playbook:site.yml"
+  ]
+}
+```
+
+These claims are exactly what Vault needs for full-tree scoping via
+`bound_claims`. But the JWT is only minted when a "HashiCorp Vault Secret
+Lookup (OIDC)" credential is explicitly attached to each job template.
+There is no credential inheritance from org or project level, and no
 default OIDC credential per organization.
 
-**Impact:** To use the rich claims that are already built into the JWT,
-an admin must manually attach the OIDC credential to every job template.
-This does not scale for large multi-tenant environments.
+**What's needed:** Either (a) credential inheritance so an OIDC credential
+attached at the org level applies to all JTs in that org, or (b) a default
+OIDC credential per organization, or (c) automatic JWT minting for all jobs
+when `FEATURE_OIDC_WORKLOAD_IDENTITY_ENABLED` is on.
 
-### Labels and JWT Are Complementary
+**Impact on this pattern:** The JWT path is the most direct route to
+full-tree scoping because the claims already exist. If the JWT were
+automatically minted, Vault could use `bound_claims` to match any
+combination of org/project/JT/playbook, with no SPIRE selectors needed
+at all.
 
-| Mechanism | Audience | Strength |
+### How Labels and JWT Work Together
+
+| Mechanism | Scoping Level | How It Works |
 |---|---|---|
-| Pod/container labels | SPIRE, Istio, OPA, infrastructure tools | Enables infrastructure-level attestation |
-| OIDC JWT claims | Vault, cloud IAM, application-level auth | Cryptographically signed, contains full org hierarchy |
+| Pod labels + SPIRE | Any level of the org tree | SPIRE selectors match pod labels; each unique combination of labels gets a distinct SPIFFE ID |
+| OIDC JWT + Vault bound_claims | Any level of the org tree | Vault matches JWT claims directly; `bound_claims` can filter on any combination of org/project/JT/playbook |
+| Both combined | Defense in depth | SPIRE attests the pod identity at infrastructure level; JWT carries the claims for application-level authorization |
 
-Both are needed: labels for external attestation systems that operate at
-the infrastructure layer; JWT for direct Vault authorization. This POC
-uses labels + SPIRE as a bridge until the JWT activation gap is resolved.
+Both approaches can provide full-tree scoping independently. Labels
+benefit SPIRE and all infrastructure-level identity systems. JWT benefits
+Vault and cloud IAM directly. Using both provides defense in depth.
+
+This POC uses labels + SPIRE at the org level as a bridge. With the AWX
+changes described above, the same architecture extends to project, JT,
+and playbook level with no additional components.
 
 ---
 
