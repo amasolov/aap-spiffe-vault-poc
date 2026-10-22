@@ -250,7 +250,7 @@ cd aap-spiffe-vault-poc
 export KUBECONFIG=/path/to/your/kubeconfig
 
 ansible-playbook deploy-poc.yml              # Full deploy
-ansible-playbook demo-scenarios.yml          # All three demos
+ansible-playbook demo-scenarios.yml          # Identity chain, isolation, full tree
 ansible-playbook teardown-poc.yml            # Cleanup (AAP untouched)
 ```
 
@@ -295,14 +295,19 @@ aap_namespace: aap
 
 ## Demo Scenarios
 
-1. **Platform Zero-Trust Identity**: Static credential replaced with
-   short-lived SPIFFE JWT, attested by kubelet, scoped to `hub/aap/*`.
+Three progressive demos (`demo-scenarios.yml`), each building on the last:
 
-2. **Multi-Org Secret Isolation**: 4 orgs, each with its own SPIFFE ID
-   and Vault policy. Cross-org access denied (HTTP 403).
+1. **Identity Chain** (`--tags scenario1`): Prove the trust chain end-to-end:
+   pod label → SPIRE attestation → JWT-SVID → Vault auth → scoped secret.
 
-3. **EDA Dynamic Credentials**: Event-driven Vault credential fetch at
-   rulebook activation time. Credentials never persisted in AAP.
+2. **Org-Level Isolation** (`--tags scenario2`): Infra-Corp reads its own
+   secrets, then attempts cross-org access to SecOps-Team, AppDev-Squad,
+   and Platform-Ops. All three return HTTP 403.
+
+3. **Full Org-Tree Scoping** (`--tags scenario3`): Walk through the target
+   architecture: what AWX pod labels, SPIRE entries, and Vault policies
+   look like at project, JT, and playbook depth. Conceptual (requires
+   Gap 1) but uses the exact same SPIRE/Vault infrastructure.
 
 ---
 
