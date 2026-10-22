@@ -223,19 +223,25 @@ The `spiffe_vault` lookup plugin authenticates to Vault per call using the
 pod's JWT-SVID. The Vault role determines the secret scope:
 
 ```yaml
-# Org-level secret (works today)
+# 1. Org-level secret (works today)
 db_password: "{{ lookup('spiffe_vault',
     'secret/data/aap/org/infra-corp/credentials',
     field='cloud_password',
     vault_role='aap-org-infra-corp') }}"
 
-# Project-level secret (requires AWX pod labels, Gap 1)
+# 2. Project-level secret (requires AWX pod labels, Gap 1)
 deploy_key: "{{ lookup('spiffe_vault',
     'secret/data/aap/org/infra-corp/project/cloud-infra/credentials',
     field='deploy_key',
     vault_role='aap-org-infra-corp-proj-cloud-infra') }}"
 
-# Playbook-level secret (requires AWX pod labels, Gap 1)
+# 3. Job-template-level secret (requires AWX pod labels, Gap 1)
+staging_token: "{{ lookup('spiffe_vault',
+    'secret/data/aap/org/infra-corp/project/cloud-infra/jt/deploy-staging/credentials',
+    field='deploy_token',
+    vault_role='aap-infra-corp-cloud-infra-deploy-staging') }}"
+
+# 4. Playbook-level secret (requires AWX pod labels, Gap 1)
 prod_aws_key: "{{ lookup('spiffe_vault',
     'secret/data/aap/org/infra-corp/project/cloud-infra/jt/deploy-prod/playbook/site.yml/credentials',
     field='aws_secret_key',
