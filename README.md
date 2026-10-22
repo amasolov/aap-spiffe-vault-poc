@@ -69,24 +69,35 @@ Today, this information is not exposed on the container.
 | Infrastructure attestation | No pod/container labels at any level | Labels on K8s pods and podman containers |
 | Cross-cluster trust | Separate config per cluster | SPIRE federation |
 
-### Two Complementary Gaps
+### Three Gaps Blocking Full-Tree Scoping
 
-1. **Labels for external attestation**: AWX does not label K8s pods or
-   podman containers with org/project/JT/playbook metadata. SPIRE, Istio,
-   OPA, and other infrastructure tools cannot differentiate AAP workloads
-   at any level of the org tree.
+Each gap blocks a different execution model or auth path. All three must
+be addressed for complete coverage.
 
-2. **Activation for built-in OIDC JWT**: AAP 2.7's OIDC JWT already
-   contains the full org hierarchy (`organization_name`, `project_name`,
-   `job_template_name`, `playbook_name`, hierarchical `groups` claim with
-   `org:X/project:Y/jt:Z/playbook:P`). The claims for full-tree scoping
-   already exist in the code. But the JWT is only minted when a
-   "HashiCorp Vault Secret Lookup (OIDC)" credential is explicitly
-   attached to each job template. There is no credential inheritance or
-   default OIDC credential per organization.
+| # | Gap | Execution Model | Blocks | Fix Complexity |
+|---|---|---|---|---|
+| 1 | No pod labels with org tree | K8s (OCP, EKS) | SPIRE, OPA, Istio, any infra-level identity | ~10 lines in `receptor.py` |
+| 2 | No container labels with org tree | Podman (on-prem VMs) | SPIRE on VMs, systemd, any container attestation | `--label` flags + new `container_options_override` model field |
+| 3 | OIDC JWT not automatically minted | Both (the JWT is generated in the controller) | Vault `bound_claims`, cloud IAM, any app-level auth that could use the JWT directly | Credential inheritance or auto-minting when feature flag is on |
 
-Both gaps are detailed in [Open Questions](#open-questions-for-aap-product)
-below.
+**Gaps 1 and 2** are about making the org tree visible to
+**infrastructure-level** systems. These systems operate outside AAP:
+they see pods and containers, not job templates. Without labels, they
+cannot tell one AAP job from another.
+
+**Gap 3** is about making the org tree available to
+**application-level** auth. The JWT claims already contain the full
+hierarchy (`org:X/project:Y/jt:Z/playbook:P`). The code to populate
+them exists and is tested. The only issue is activation: the JWT is
+minted only when a specific credential type is manually attached to
+each job template.
+
+Gaps 1+2 and Gap 3 are complementary, not alternative. Labels enable
+infrastructure attestation (SPIRE, mesh identity). JWT enables direct
+Vault auth (no SPIRE needed). Using both provides defense in depth.
+
+Details and source code references in
+[Open Questions](#open-questions-for-aap-product).
 
 ---
 
@@ -352,21 +363,22 @@ automatically minted, Vault could use `bound_claims` to match any
 combination of org/project/JT/playbook, with no SPIRE selectors needed
 at all.
 
-### How Labels and JWT Work Together
+### How the Gaps Map to Full-Tree Scoping
 
-| Mechanism | Scoping Level | How It Works |
+Each gap, once resolved, independently unlocks full org-tree scoping
+through a different mechanism:
+
+| Gap Fixed | What It Unlocks | Example |
 |---|---|---|
-| Pod labels + SPIRE | Any level of the org tree | SPIRE selectors match pod labels; each unique combination of labels gets a distinct SPIFFE ID |
-| OIDC JWT + Vault bound_claims | Any level of the org tree | Vault matches JWT claims directly; `bound_claims` can filter on any combination of org/project/JT/playbook |
-| Both combined | Defense in depth | SPIRE attests the pod identity at infrastructure level; JWT carries the claims for application-level authorization |
+| Gap 1 (K8s pod labels) | SPIRE assigns SPIFFE IDs at any tree depth on OCP/EKS | `k8s:pod-label:aap-project:cloud-infra` selector matches only that project's pods |
+| Gap 2 (podman labels) | SPIRE (or systemd) assigns identities on VM execution nodes | `docker:label:aap-jt:deploy-prod` selector matches only that JT's containers |
+| Gap 3 (auto JWT) | Vault `bound_claims` scopes secrets directly, no SPIRE needed | `"bound_claims": {"aap_controller_playbook_name": "site.yml"}` |
+| Gaps 1+3 combined | Defense in depth: SPIRE attests at infra layer, JWT authorizes at app layer | Pod proven to be `deploy-prod` by kubelet, JWT proves `playbook:site.yml` cryptographically |
 
-Both approaches can provide full-tree scoping independently. Labels
-benefit SPIRE and all infrastructure-level identity systems. JWT benefits
-Vault and cloud IAM directly. Using both provides defense in depth.
-
-This POC uses labels + SPIRE at the org level as a bridge. With the AWX
-changes described above, the same architecture extends to project, JT,
-and playbook level with no additional components.
+This POC uses Gap 1's workaround (Container Group labels at org level) +
+SPIRE to demonstrate org-level isolation. With the AWX changes, the same
+architecture extends to project, JT, and playbook level with no additional
+components.
 
 ---
 
