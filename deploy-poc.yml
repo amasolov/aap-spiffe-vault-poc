@@ -83,7 +83,7 @@
                 NodeAttestor "k8s_psat" {
                   plugin_data {
                     clusters = {
-                      "hosted-1" = {
+                      "local" = {
                         service_account_allow_list = ["{{ spire_namespace }}:spire-agent"]
                       }
                     }
@@ -293,7 +293,7 @@
               plugins {
                 NodeAttestor "k8s_psat" {
                   plugin_data {
-                    cluster = "hosted-1"
+                    cluster = "local"
                   }
                 }
 
@@ -417,6 +417,107 @@
                             path: spire-agent
                             expirationSeconds: 7200
                             audience: spire-server
+
+    # --- SPIFFE CSI Driver ---
+    - name: Deploy SPIFFE CSI Driver DaemonSet
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: apps/v1
+          kind: DaemonSet
+          metadata:
+            name: spiffe-csi-driver
+            namespace: "{{ spire_namespace }}"
+          spec:
+            selector:
+              matchLabels:
+                app: spiffe-csi-driver
+            template:
+              metadata:
+                labels:
+                  app: spiffe-csi-driver
+              spec:
+                serviceAccountName: spire-agent
+                containers:
+                  - name: spiffe-csi-driver
+                    image: "{{ spiffe_csi_image }}"
+                    args:
+                      - "-workload-api-socket-dir"
+                      - "/run/spire/sockets"
+                      - "-csi-socket-path"
+                      - "/spiffe-csi/csi.sock"
+                    securityContext:
+                      privileged: true
+                    volumeMounts:
+                      - name: spire-agent-socket
+                        mountPath: /run/spire/sockets
+                        readOnly: true
+                      - name: mountpoint-dir
+                        mountPath: /var/lib/kubelet/pods
+                        mountPropagation: Bidirectional
+                      - name: plugin-dir
+                        mountPath: /spiffe-csi
+                  - name: node-driver-registrar
+                    image: "{{ spiffe_csi_node_registrar_image }}"
+                    args:
+                      - "-csi-address"
+                      - "/spiffe-csi/csi.sock"
+                      - "-kubelet-registration-path"
+                      - "/var/lib/kubelet/plugins/csi.spiffe.io/csi.sock"
+                    volumeMounts:
+                      - name: plugin-dir
+                        mountPath: /spiffe-csi
+                      - name: registration-dir
+                        mountPath: /registration
+                volumes:
+                  - name: spire-agent-socket
+                    hostPath:
+                      path: /run/spire/sockets
+                      type: DirectoryOrCreate
+                  - name: mountpoint-dir
+                    hostPath:
+                      path: /var/lib/kubelet/pods
+                      type: Directory
+                  - name: plugin-dir
+                    hostPath:
+                      path: /var/lib/kubelet/plugins/csi.spiffe.io
+                      type: DirectoryOrCreate
+                  - name: registration-dir
+                    hostPath:
+                      path: /var/lib/kubelet/plugins_registry
+                      type: Directory
+
+    - name: Deploy SPIFFE CSI Driver CSIDriver resource
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: storage.k8s.io/v1
+          kind: CSIDriver
+          metadata:
+            name: csi.spiffe.io
+          spec:
+            attachRequired: false
+            podInfoOnMount: true
+            fsGroupPolicy: None
+            volumeLifecycleModes:
+              - Ephemeral
+
+    - name: Grant SPIFFE CSI Driver privileged SCC
+      ansible.builtin.command:
+        cmd: "oc adm policy add-scc-to-user privileged -z spire-agent -n {{ spire_namespace }}"
+      changed_when: true
+      failed_when: false
+
+    - name: Wait for SPIFFE CSI Driver to be ready
+      ansible.builtin.shell:
+        cmd: >-
+          oc rollout status daemonset/spiffe-csi-driver
+          -n {{ spire_namespace }} --timeout=120s
+      changed_when: false
+      register: __csi_ready
+      retries: 3
+      delay: 10
+      until: __csi_ready.rc == 0
 
     # --- OIDC Discovery Provider ---
     - name: Deploy OIDC Discovery Provider ConfigMap
@@ -1145,8 +1246,8 @@
           data:
             helper.conf: |
               agent_address = "/run/spire/sockets/agent.sock"
-              cmd = ""
               cert_dir = "/svids"
+              key_file_mode = 0600
               svid_file_name = "svid.pem"
               svid_key_file_name = "svid_key.pem"
               svid_bundle_file_name = "svid_bundle.pem"
@@ -1167,19 +1268,9 @@
         namespace: "{{ aap_namespace }}"
       failed_when: false
 
-    - name: Label AAP namespace for privileged pod security
+    - name: Label AAP namespace for baseline pod security
       ansible.builtin.command:
-        cmd: "oc label namespace {{ aap_namespace }} pod-security.kubernetes.io/enforce=privileged --overwrite"
-      changed_when: true
-      failed_when: false
-
-    - name: Grant AAP service accounts privileged SCC (for hostPath SPIRE socket + seccomp)
-      ansible.builtin.command:
-        cmd: "oc adm policy add-scc-to-user privileged -z {{ item }} -n {{ aap_namespace }}"
-      loop:
-        - aap-controller
-        - aap-eda
-        - aap-gateway
+        cmd: "oc label namespace {{ aap_namespace }} pod-security.kubernetes.io/enforce=baseline --overwrite"
       changed_when: true
       failed_when: false
 
@@ -1240,13 +1331,10 @@
                           - "-config"
                           - "/run/spire/config/helper.conf"
                           - "-daemon-mode=false"
-                        securityContext:
-                          privileged: true
-                          seLinuxOptions:
-                            type: spc_t
                         volumeMounts:
-                          - name: spire-agent-socket
+                          - name: spiffe-workload-api
                             mountPath: /run/spire/sockets
+                            readOnly: true
                           - name: svids
                             mountPath: /svids
                           - name: spiffe-helper-config
@@ -1258,10 +1346,6 @@
                         name: init-spiffe-vault-client
                         image: registry.access.redhat.com/ubi9/python-311:latest
                         command: ["python3", "/opt/app-root/src/spiffe-vault-client.py", "--init"]
-                        securityContext:
-                          privileged: true
-                          seLinuxOptions:
-                            type: spc_t
                         env:
                           - name: VAULT_URL
                             value: "http://vault.{{ vault_namespace }}.svc.cluster.local:8200"
@@ -1290,13 +1374,10 @@
                         args:
                           - "-config"
                           - "/run/spire/config/helper.conf"
-                        securityContext:
-                          privileged: true
-                          seLinuxOptions:
-                            type: spc_t
                         volumeMounts:
-                          - name: spire-agent-socket
+                          - name: spiffe-workload-api
                             mountPath: /run/spire/sockets
+                            readOnly: true
                           - name: svids
                             mountPath: /svids
                           - name: spiffe-helper-config
@@ -1308,10 +1389,6 @@
                         name: spiffe-vault-client
                         image: registry.access.redhat.com/ubi9/python-311:latest
                         command: ["python3", "/opt/app-root/src/spiffe-vault-client.py"]
-                        securityContext:
-                          privileged: true
-                          seLinuxOptions:
-                            type: spc_t
                         env:
                           - name: VAULT_URL
                             value: "http://vault.{{ vault_namespace }}.svc.cluster.local:8200"
@@ -1335,10 +1412,10 @@
                     - op: add
                       path: /spec/volumes/-
                       value:
-                        name: spire-agent-socket
-                        hostPath:
-                          path: /run/spire/sockets
-                          type: Directory
+                        name: spiffe-workload-api
+                        csi:
+                          driver: csi.spiffe.io
+                          readOnly: true
                     - op: add
                       path: /spec/volumes/-
                       value:
@@ -1413,13 +1490,10 @@
                     - "-config"
                     - "/run/spire/config/helper.conf"
                     - "-daemon-mode=false"
-                  securityContext:
-                    privileged: true
-                    seLinuxOptions:
-                      type: spc_t
                   volumeMounts:
-                    - name: spire-agent-socket
+                    - name: spiffe-workload-api
                       mountPath: /run/spire/sockets
+                      readOnly: true
                     - name: svids
                       mountPath: /svids
                     - name: spiffe-helper-config
@@ -1432,10 +1506,10 @@
                       mountPath: /svids
                       readOnly: true
               volumes:
-                - name: spire-agent-socket
-                  hostPath:
-                    path: /run/spire/sockets
-                    type: Directory
+                - name: spiffe-workload-api
+                  csi:
+                    driver: csi.spiffe.io
+                    readOnly: true
                 - name: svids
                   emptyDir: {}
                 - name: spiffe-helper-config

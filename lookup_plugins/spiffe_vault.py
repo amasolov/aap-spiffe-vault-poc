@@ -11,13 +11,13 @@ Usage in playbooks:
 
     # Fetch a single field
     db_password: "{{ lookup('spiffe_vault',
-        'secret/data/aap/org/infra-corp/creds',
-        field='db_password',
+        'secret/data/aap/org/infra-corp/credentials',
+        field='cloud_password',
         vault_role='aap-org-infra-corp') }}"
 
     # Fetch all fields as a dict
     all_secrets: "{{ lookup('spiffe_vault',
-        'secret/data/aap/org/infra-corp/creds',
+        'secret/data/aap/org/infra-corp/credentials',
         vault_role='aap-org-infra-corp') }}"
 
 Environment variables (overridable via kwargs):
@@ -50,7 +50,7 @@ DOCUMENTATION = r"""
         matches the SPIFFE identity of the EE pod running the job.
     options:
       _terms:
-        description: Vault KV v2 secret path (e.g. secret/data/aap/org/infra-corp/creds)
+        description: Vault KV v2 secret path (e.g. secret/data/aap/org/infra-corp/credentials)
         required: true
       vault_role:
         description: Vault JWT auth role name

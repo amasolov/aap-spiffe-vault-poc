@@ -4,7 +4,7 @@
 # ============================================================
 
 # Cluster
-cluster_domain: "apps.hosted-1.alexeym.apac.sysmgmt.cee.redhat.com"
+cluster_domain: "apps.your-cluster.example.com"
 kubeconfig: "{{ lookup('env', 'KUBECONFIG') | default('~/.kube/config', true) }}"
 
 # SPIRE
@@ -14,6 +14,8 @@ spire_server_image: "ghcr.io/spiffe/spire-server:1.12.0"
 spire_agent_image: "ghcr.io/spiffe/spire-agent:1.12.0"
 spire_oidc_image: "ghcr.io/spiffe/oidc-discovery-provider:1.12.0"
 spire_helper_image: "ghcr.io/spiffe/spiffe-helper:0.8.0"
+spiffe_csi_image: "ghcr.io/spiffe/spiffe-csi-driver:0.2.6"
+spiffe_csi_node_registrar_image: "registry.k8s.io/sig-storage/csi-node-driver-registrar:v2.12.0"
 
 # Vault
 vault_namespace: vault
@@ -124,13 +126,10 @@ ee_pod_spec_template:
           - "-config"
           - "/run/spire/config/helper.conf"
           - "-daemon-mode=false"
-        securityContext:
-          privileged: true
-          seLinuxOptions:
-            type: spc_t
         volumeMounts:
-          - name: spire-agent-socket
+          - name: spiffe-workload-api
             mountPath: /run/spire/sockets
+            readOnly: true
           - name: svids
             mountPath: /svids
           - name: spiffe-helper-config
@@ -143,10 +142,10 @@ ee_pod_spec_template:
             mountPath: /svids
             readOnly: true
     volumes:
-      - name: spire-agent-socket
-        hostPath:
-          path: /run/spire/sockets
-          type: Directory
+      - name: spiffe-workload-api
+        csi:
+          driver: csi.spiffe.io
+          readOnly: true
       - name: svids
         emptyDir: {}
       - name: spiffe-helper-config

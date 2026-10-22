@@ -14,7 +14,7 @@
 
 # ============================================================
 # Scenario 1: Platform Zero-Trust
-# "AAP authenticates to Vault with SPIFFE identity, not root token"
+# "AAP authenticates to Vault with SPIFFE identity, cryptographically attested"
 # ============================================================
 - name: "Scenario 1: Platform Zero-Trust Identity"
   hosts: localhost
@@ -24,21 +24,21 @@
   environment:
     KUBECONFIG: "{{ kubeconfig }}"
   tasks:
-    - name: "DEMO: Show the problem - root token has god access"
+    - name: "DEMO: SPIFFE identity replaces static credentials"
       ansible.builtin.pause:
         prompt: |
           ╔══════════════════════════════════════════════════════════════╗
           ║  SCENARIO 1: Platform Zero-Trust Identity                  ║
           ╠══════════════════════════════════════════════════════════════╣
           ║                                                            ║
-          ║  BEFORE: AAP uses the Vault root token.                    ║
-          ║  Root token can read ANY secret in Vault.                  ║
-          ║  It never expires. It never rotates.                       ║
+          ║  BEFORE: AAP uses a static credential for Vault.           ║
+          ║  The credential is stored in the AAP database.             ║
+          ║  It requires manual rotation and has broad scope.          ║
           ║                                                            ║
           ║  AFTER: AAP uses a SPIFFE JWT identity.                    ║
-          ║  The JWT is valid for 5 minutes.                           ║
+          ║  The JWT is valid for 5 minutes, auto-rotated.             ║
           ║  The Vault token is scoped to aap/* paths only.            ║
-          ║  Identity is cryptographic, not a shared secret.           ║
+          ║  Identity is cryptographic, attested by kubelet.           ║
           ║                                                            ║
           ╚══════════════════════════════════════════════════════════════╝
           Press ENTER to begin the demo...
@@ -147,7 +147,7 @@ except HTTPError as e:
                   ]
                 }],
                 "volumes": [
-                  {"name": "spire-socket", "hostPath": {"path": "/run/spire/sockets", "type": "Directory"}},
+                  {"name": "spire-socket", "csi": {"driver": "csi.spiffe.io", "readOnly": true}},
                   {"name": "svids", "emptyDir": {}},
                   {"name": "helper-config", "configMap": {"name": "spiffe-helper-config"}}
                 ]

@@ -56,6 +56,15 @@
       tags: [kyverno]
 
     # --- Delete SPIRE ---
+    - name: Delete SPIFFE CSI Driver resource
+      kubernetes.core.k8s:
+        state: absent
+        kind: CSIDriver
+        name: csi.spiffe.io
+        api_version: storage.k8s.io/v1
+      ignore_errors: true
+      tags: [spire]
+
     - name: Delete SPIRE ClusterRoleBindings
       kubernetes.core.k8s:
         state: absent
